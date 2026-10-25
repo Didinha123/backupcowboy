@@ -3368,6 +3368,7 @@ function renderConfiguracoes() {
       </p>
       <button class="btn btn--secondary btn--block" id="cfg-api-sync-btn">🔄 Sincronizar agora</button>
       <button class="btn btn--secondary btn--block" id="cfg-api-enviar-btn">📤 Enviar dados deste aparelho para ${usandoSupabase() ? "o banco" : "a planilha"}</button>
+      ${usandoSupabase() ? `<button class="btn btn--secondary btn--block" id="cfg-api-conferir-btn">🔎 Conferir o que está no banco</button>` : ""}
 
       <h4 class="section-subtitle">Segurança dos dados</h4>
       <button class="btn btn--secondary btn--block" id="cfg-exportar-btn">📤 Exportar dados</button>
@@ -3417,6 +3418,31 @@ function renderConfiguracoes() {
         }
       },
     });
+  });
+
+  // Compara, lado a lado, o que há no banco e o que há neste aparelho (serve pra
+  // conferir se a migração copiou tudo).
+  document.getElementById("cfg-api-conferir-btn")?.addEventListener("click", async () => {
+    showToast("Consultando o banco...");
+    try {
+      const r = await sbBuscarTudo();
+      const linha = (nome, banco, aparelho) => `${nome}: banco <strong>${banco}</strong> · aparelho <strong>${aparelho}</strong>`;
+      openConfirm({
+        title: "🔎 Banco x este aparelho",
+        message: [
+          linha("Clientes", r.clientes.filter((c) => c.id !== CLIENTE_AVULSO_ID).length, db.clientes.filter((c) => c.id !== CLIENTE_AVULSO_ID).length),
+          linha("Vendas", r.vendas.length, db.vendas.length),
+          linha("Itens de venda", r.itensVenda.length, db.itensVenda.length),
+          linha("Pagamentos", r.pagamentos.length, db.pagamentos.length),
+          "",
+          "Se o banco estiver com 0 e o aparelho com dados, use \"Enviar dados deste aparelho\".",
+        ].join("\n"),
+        confirmText: "OK",
+        somenteConfirmar: true,
+      });
+    } catch (err) {
+      showToast("Não consegui consultar o banco: " + (err.message || "erro"));
+    }
   });
 
   document.getElementById("cfg-api-sync-btn").addEventListener("click", () => {
