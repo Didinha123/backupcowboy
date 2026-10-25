@@ -67,8 +67,8 @@ function generateId(prefix) {
 // aparelhos por causa disso. Sem "cada aparelho guarda sua própria URL",
 // esse jeito de dessincronizar não existe mais.
 const DEFAULT_API_URL =
-  "https://script.google.com/macros/s/AKfycbxakb70vpYvvZfuEgDFTHG-6D4SQBoVpRqj5ntsZ-VDHuxrP9UutD4wOhuIIRXvhEHDCA/exec";
- let apiUrl = "";
+  "https://script.google.com/macros/s/AKfycby7gdpXO1dJdiTK4Buyv9XDROx1NJOVB9qyQrUd_TAFgK883Qr9MVg79Nq3fxcbIG7Ehw/exec";
+let apiUrl = "";
 let lastSyncAt = null;
 
 function loadApiUrl() {
@@ -3821,12 +3821,21 @@ function renderRelatorioPagamentos() {
             </div>`
           : ""
       }
-      <div class="form-field">
-        <label for="relpag-cliente">Cliente</label>
-        <select id="relpag-cliente">
-          <option value="">Todos</option>
-          ${clientesOrdenados.map((c) => `<option value="${c.id}" ${sel(f.clienteFiltro === c.id)}>${c.nome}</option>`).join("")}
-        </select>
+      <div class="stat-row stat-row--2">
+        <div class="form-field">
+          <label for="relpag-cliente">Cliente</label>
+          <select id="relpag-cliente">
+            <option value="">Todos</option>
+            ${clientesOrdenados.map((c) => `<option value="${c.id}" ${sel(f.clienteFiltro === c.id)}>${c.nome}</option>`).join("")}
+          </select>
+        </div>
+        <div class="form-field">
+          <label for="relpag-forma">Forma</label>
+          <select id="relpag-forma">
+            <option value="">Todas</option>
+            ${FORMAS_PAGAMENTO_VISTA.map((m) => `<option value="${m.id}" ${sel(f.formaFiltro === m.id)}>${m.label}</option>`).join("")}
+          </select>
+        </div>
       </div>
 
       <div class="stat-row stat-row--2">
@@ -3835,6 +3844,7 @@ function renderRelatorioPagamentos() {
       </div>
 
       <h4 class="section-subtitle">Histórico de pagamentos (${r.eventos.length})</h4>
+      ${r.formas.length ? `<p class="relpag-formas">${r.formas.map((x) => `${nomeForma(x.forma)} <strong>${formatCurrency(x.total)}</strong>`).join(" · ")}</p>` : ""}
       <ul class="list">
         ${
           r.eventos.length === 0
@@ -3844,7 +3854,7 @@ function renderRelatorioPagamentos() {
                   const nome = getCliente(e.clienteId)?.nome || "Cliente";
                   return `<li class="list-item">
                     <div class="list-item__main"><strong>${nome}</strong><span class="list-item__meta">${formatDateTime(e.data)}</span></div>
-                    <div class="list-item__side"><span class="list-item__value">${formatCurrency(e.valor)}</span></div>
+                    <div class="list-item__side"><span class="list-item__value">${formatCurrency(e.valor)}</span><span class="badge badge--success">${nomeForma(e.formaPagamento)}</span></div>
                   </li>`;
                 })
                 .join("")
@@ -3865,6 +3875,10 @@ function renderRelatorioPagamentos() {
   });
   document.getElementById("relpag-cliente").addEventListener("change", (e) => {
     f.clienteFiltro = e.target.value;
+    reRender();
+  });
+  document.getElementById("relpag-forma").addEventListener("change", (e) => {
+    f.formaFiltro = e.target.value;
     reRender();
   });
   document.getElementById("relpag-start")?.addEventListener("change", (e) => {
