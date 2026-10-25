@@ -3527,7 +3527,7 @@ function montarAbaAcerto() {
   const botao = document.createElement("button");
   botao.className = "nav-btn";
   botao.dataset.view = "acerto";
-  botao.innerHTML = `<span class="nav-btn__icon">🤝</span><span>Acerto</span>`;
+  botao.innerHTML = `<span class="nav-btn__icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H19a1 1 0 0 1 1 1v2"/><path d="M3 7.5V18a2 2 0 0 0 2 2h14a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1H5.5A2.5 2.5 0 0 1 3 7.5z"/><circle cx="16.5" cy="14.5" r="1.2"/></svg></span><span>Acerto</span>`;
   document.querySelector('.nav-btn[data-view="fiado"]').insertAdjacentElement("afterend", botao);
 }
 
