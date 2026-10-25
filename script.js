@@ -75,6 +75,31 @@ function loadApiUrl() {
   apiUrl = DEFAULT_API_URL;
 }
 
+// Cores do app: a paleta escolhida fica guardada neste aparelho e vale pro
+// visual todo (o CSS lê o atributo data-tema). O padrão é o azul-petróleo.
+const TEMA_KEY = "cowboySalgadosTema_v1";
+const TEMAS = [
+  { id: "petroleo", nome: "Azul-petróleo", cor: "#0e6b86" },
+  { id: "marinho", nome: "Azul-marinho", cor: "#2b4a8b" },
+  { id: "grafite", nome: "Grafite", cor: "#2f3b48" },
+  { id: "esmeralda", nome: "Esmeralda", cor: "#0f7a5c" },
+  { id: "terracota", nome: "Terracota", cor: "#b0452a" },
+];
+
+function getTema() {
+  const salvo = localStorage.getItem(TEMA_KEY);
+  return TEMAS.some((t) => t.id === salvo) ? salvo : "petroleo";
+}
+
+function aplicarTema(id) {
+  if (!TEMAS.some((t) => t.id === id)) id = "petroleo";
+  localStorage.setItem(TEMA_KEY, id);
+  document.documentElement.dataset.tema = id;
+  // cor da barra do navegador no celular acompanha a paleta
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", getComputedStyle(document.documentElement).getPropertyValue("--primary-dark").trim() || "#084a5e");
+}
+
 // Chave de acesso: a URL acima fica num site público, então o Apps Script
 // (propriedade CHAVE_ACESSO) só atende quem enviar a chave certa. Cada
 // aparelho digita a chave uma vez e ela fica guardada aqui.
@@ -2926,6 +2951,16 @@ function renderConfiguracoes() {
       <div class="form-field"><label>Estoque mínimo (Salgado)</label><input id="cfg-min-salgado" type="number" inputmode="numeric" value="${c.estoqueMinimoSalgado}" /></div>
       <button class="btn btn--primary btn--block" id="cfg-salvar-btn">Salvar configurações</button>
 
+      <h4 class="section-subtitle">🎨 Cores do app</h4>
+      <div class="tema-opcoes">
+        ${TEMAS.map(
+          (t) => `<button type="button" class="tema-opcao ${getTema() === t.id ? "tema-opcao--ativa" : ""}" data-tema-id="${t.id}">
+            <span class="tema-opcao__cor" style="background:${t.cor}"></span>
+            <span>${t.nome}</span>
+          </button>`
+        ).join("")}
+      </div>
+
       <h4 class="section-subtitle">📊 Planilha do Google</h4>
       <p class="field-hint">
         Este app já vem conectado à planilha compartilhada do negócio — todo aparelho usa a
@@ -2944,6 +2979,12 @@ function renderConfiguracoes() {
   `;
 
   el.querySelector('[data-action="fechar-config"]').addEventListener("click", () => closeOverlay("overlay-configuracoes"));
+  el.querySelectorAll("[data-tema-id]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      aplicarTema(btn.dataset.temaId);
+      el.querySelectorAll("[data-tema-id]").forEach((b) => b.classList.toggle("tema-opcao--ativa", b === btn));
+    });
+  });
   document.getElementById("cfg-salvar-btn").addEventListener("click", () => {
     salvarConfiguracoes({
       nomeNegocio: document.getElementById("cfg-nome").value.trim() || "Cowboy Salgados",
@@ -3950,6 +3991,7 @@ const SYNC_INTERVAL_MS = 60 * 1000;
 
 function init() {
   loadApiUrl();
+  aplicarTema(getTema());
   initDB();
   montarAbaAcerto(); // antes dos listeners, pra o botão novo da navegação também funcionar
   initEventListeners();
