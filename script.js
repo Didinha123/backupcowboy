@@ -1,0 +1,3954 @@
+/* ==========================================================================
+   COWBOY SALGADOS — script.js
+   Sistema de vendas e controle financeiro 100% front-end (HTML+CSS+JS puro).
+   Persistência via localStorage. Otimizado para uso no celular.
+   ========================================================================== */
+
+"use strict";
+
+/* ==========================================================================
+   1. CONSTANTES
+   ========================================================================== */
+
+const STORAGE_KEY = "cowboySalgadosDB_v1";
+
+const PRODUTO_IDS = {
+  SALGADO: "p-salgado",
+  REFRIGERANTE: "p-refrigerante",
+  TRUFA: "p-trufa",
+};
+
+const FORMAS_PAGAMENTO_VISTA = [
+  { id: "debito", label: "Débito", icon: "💳" },
+  { id: "credito", label: "Crédito (cartão)", icon: "💳" },
+  { id: "pix", label: "PIX", icon: "📱" },
+  { id: "dinheiro", label: "Dinheiro", icon: "💵" },
+];
+
+const CLIENTE_AVULSO_ID = "cliente-avulso";
+
+let db = null; // banco de dados em memória, espelha o localStorage
+
+/* ==========================================================================
+   2. PERSISTÊNCIA (localStorage)
+   ========================================================================== */
+
+function loadDB() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.error("Erro ao ler dados salvos, iniciando do zero.", err);
+    return null;
+  }
+}
+
+function saveDB() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+}
+
+function generateId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* ==========================================================================
+   2.1 SINCRONIZAÇÃO COM GOOGLE SHEETS (opcional)
+   --------------------------------------------------------------------------
+   Se o negócio configurar a URL de um Apps Script (Configurações), o app
+   passa a usar uma planilha do Google como fonte de verdade compartilhada
+   entre aparelhos. O localStorage continua sendo usado como cache local
+   (para abrir instantaneamente e funcionar mesmo sem internet); a cada
+   escrita, tentamos sincronizar em segundo plano, sem travar a interface.
+   ========================================================================== */
+
+// Planilha compartilhada do negócio — fixa no código, igual em todo aparelho.
+// Isso é de propósito: já tivemos um aparelho ficar preso numa URL antiga
+// salva localmente enquanto os outros usavam a nova, e vendas sumindo entre
+// aparelhos por causa disso. Sem "cada aparelho guarda sua própria URL",
+// esse jeito de dessincronizar não existe mais.
+const DEFAULT_API_URL =
+  "https://script.google.com/macros/s/AKfycby7gdpXO1dJdiTK4Buyv9XDROx1NJOVB9qyQrUd_TAFgK883Qr9MVg79Nq3fxcbIG7Ehw/exec";
+let apiUrl = "";
+let lastSyncAt = null;
+
+function loadApiUrl() {
+  apiUrl = DEFAULT_API_URL;
+}
+
+// Chave de acesso: a URL acima fica num site público, então o Apps Script
+// (propriedade CHAVE_ACESSO) só atende quem enviar a chave certa. Cada
+// aparelho digita a chave uma vez e ela fica guardada aqui.
+const CHAVE_ACESSO_KEY = "cowboySalgadosChaveAcesso_v1";
+let tentouChave = false;
+
+function getChaveAcesso() {
+  return localStorage.getItem(CHAVE_ACESSO_KEY) || "";
+}
+
+// Busca o estado completo da planilha (fonte de verdade quando conectado).
+async function apiFetchAll() {
+  const res = await fetch(`${apiUrl}?action=getAll&chave=${encodeURIComponent(getChaveAcesso())}`);
+  if (!res.ok) throw new Error("Falha ao consultar a planilha.");
+  const json = await res.json();
+  if (json && json.error === "chave_invalida") {
+    mostrarTelaChave();
+    throw new Error("Chave de acesso inválida.");
+  }
+  return json;
+}
+
+// Envia uma ação de escrita para o Apps Script.
+// IMPORTANTE: usar Content-Type "text/plain" evita que o navegador dispare
+// um preflight CORS (OPTIONS) — o Apps Script não sabe responder a ele.
+async function apiPost(action, payload) {
+  const res = await fetch(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action, chave: getChaveAcesso(), ...payload }),
+  });
+  const json = await res.json();
+  if (json && json.error === "chave_invalida") {
+    mostrarTelaChave();
+    throw new Error("Chave de acesso inválida.");
+  }
+  if (!json.ok) throw new Error(json.error || "Falha ao sincronizar com a planilha.");
+  return json;
+}
+
+// Tela cheia pedindo a chave (por cima de tudo) — some quando a chave estiver certa.
+function mostrarTelaChave() {
+  if (document.getElementById("tela-chave")) return;
+  const tela = document.createElement("div");
+  tela.id = "tela-chave";
+  tela.className = "tela-chave";
+  tela.innerHTML = `
+    <div class="tela-chave__card">
+      <div class="tela-chave__icone">🔒</div>
+      <h2>Cowboy Salgados</h2>
+      <p>Digite a chave de acesso para entrar.</p>
+      <input type="password" id="tela-chave-input" placeholder="Chave de acesso" autocomplete="off" />
+      <p class="texto-erro" id="tela-chave-erro">${tentouChave ? "Chave incorreta. Tente de novo." : ""}</p>
+      <button type="button" class="btn btn--primary btn--block btn--xl" id="tela-chave-btn">Entrar</button>
+    </div>
+  `;
+  document.body.appendChild(tela);
+
+  const input = document.getElementById("tela-chave-input");
+  const entrar = () => {
+    const valor = input.value.trim();
+    if (!valor) return;
+    localStorage.setItem(CHAVE_ACESSO_KEY, valor);
+    tentouChave = true;
+    tela.remove();
+    syncFromRemote({ silent: true });
+  };
+  document.getElementById("tela-chave-btn").addEventListener("click", entrar);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") entrar();
+  });
+  input.focus();
+}
+
+// Dispara uma sincronização sem bloquear a interface (otimista):
+// a tela já foi atualizada com os dados locais; isso só replica pro Sheets.
+// Quantas gravações ainda estão a caminho da planilha. Enquanto houver, NÃO
+// puxamos a planilha de volta: ela ainda não tem o que acabamos de fazer, e
+// puxar agora desfaria na tela (pagamento/venda "voltando") por alguns segundos.
+let gravacoesPendentes = 0;
+let gravacoesDesde = 0; // quando a fila começou (a trava abre sozinha após 2 min, caso uma gravação trave)
+
+function syncInBackground(action, payload) {
+  if (!apiUrl) return;
+  setSyncStatus("syncing");
+  if (gravacoesPendentes === 0) gravacoesDesde = Date.now();
+  gravacoesPendentes++;
+  apiPost(action, payload)
+    .then(() => setSyncStatus("online"))
+    .catch((err) => {
+      console.error("Erro de sincronização:", err);
+      setSyncStatus("offline");
+      showToast("⚠️ Não sincronizado com a planilha. Os dados ficaram salvos só neste aparelho.");
+    })
+    .finally(() => {
+      gravacoesPendentes = Math.max(0, gravacoesPendentes - 1);
+    });
+}
+
+// Envia várias ações uma depois da outra (esperando cada uma terminar) — o
+// Apps Script não garante ordem quando recebe pedidos em paralelo na mesma aba.
+function syncSequencial(acoes) {
+  if (!apiUrl || !acoes.length) return;
+  setSyncStatus("syncing");
+  if (gravacoesPendentes === 0) gravacoesDesde = Date.now();
+  gravacoesPendentes++;
+  acoes
+    .reduce((cadeia, [action, payload]) => cadeia.then(() => apiPost(action, payload)), Promise.resolve())
+    .then(() => setSyncStatus("online"))
+    .catch((err) => {
+      console.error("Erro de sincronização:", err);
+      setSyncStatus("offline");
+      showToast("⚠️ Não sincronizado com a planilha. Os dados ficaram salvos só neste aparelho.");
+    })
+    .finally(() => {
+      gravacoesPendentes = Math.max(0, gravacoesPendentes - 1);
+    });
+}
+
+function setSyncStatus(status) {
+  const badge = document.getElementById("sync-badge");
+  if (!badge) return;
+  if (!apiUrl) {
+    badge.classList.add("hidden");
+    return;
+  }
+  badge.classList.remove("hidden");
+  const labels = {
+    syncing: { icon: "🔄", text: "Sincronizando…" },
+    online: { icon: "🟢", text: "Sincronizado" },
+    offline: { icon: "📴", text: "Offline (local)" },
+  };
+  const info = labels[status] || labels.offline;
+  if (status === "online") lastSyncAt = new Date();
+  badge.textContent = info.icon;
+  badge.title = lastSyncAt
+    ? `${info.text} — última vez: ${formatDateTime(lastSyncAt.toISOString())}`
+    : info.text;
+}
+
+// Puxa o estado atual da planilha e substitui os dados locais por ele
+// (usado na abertura do app e no botão "Sincronizar agora").
+async function syncFromRemote({ silent = false } = {}) {
+  if (!apiUrl) return;
+  if (gravacoesPendentes > 0 && Date.now() - gravacoesDesde < 120000) {
+    // Ainda enviando algo: puxar agora sobrescreveria o que a tela acabou de mostrar.
+    if (!silent) showToast("Aguarde: ainda enviando dados para a planilha...");
+    return;
+  }
+  setSyncStatus("syncing");
+  try {
+    const remote = await apiFetchAll();
+    // A planilha é uma fonte externa (pode estar mal configurada ou com o
+    // Apps Script desatualizado) — só aceita o pacote se vier com o mínimo
+    // necessário pro app funcionar. "configuracoes" às vezes não vem (bug
+    // no Apps Script publicado) — nesse caso usa os padrões locais em vez
+    // de rejeitar os dados reais (clientes/vendas) que vieram certinhos.
+    if (!remote || !remote.clientes || !remote.vendas || !remote.produtos || !remote.estoque) {
+      throw new Error("Resposta da planilha veio incompleta.");
+    }
+    // Se uma linha veio repetida (mesmo id duas vezes), conta uma vez só — senão
+    // clientes, vendas e pagamentos aparecem e somam em dobro.
+    const unicos = (lista, chave) => {
+      const vistos = new Set();
+      return (lista || []).filter((x) => {
+        const k = String(x[chave]);
+        if (vistos.has(k)) return false;
+        vistos.add(k);
+        return true;
+      });
+    };
+    remote.clientes = unicos(remote.clientes, "id");
+    remote.vendas = unicos(remote.vendas, "id");
+    remote.itensVenda = unicos(remote.itensVenda, "id");
+    remote.pagamentos = unicos(remote.pagamentos, "id");
+    remote.estoque = unicos(remote.estoque, "produtoId");
+    db = {
+      ...remote,
+      vendas: remote.vendas.map((v) => ({ ...v, dataPrevisaoPagamento: normalizarDataChave(v.dataPrevisaoPagamento) })),
+      configuracoes: remote.configuracoes || { ...DEFAULT_CONFIGURACOES },
+    };
+    saveDB();
+    setSyncStatus("online");
+    renderView(ui.viewAtual);
+    if (!silent) showToast("Dados sincronizados com a planilha!");
+  } catch (err) {
+    console.error("Erro ao sincronizar:", err);
+    setSyncStatus("offline");
+    if (!silent) showToast("Não foi possível conectar à planilha. Mostrando dados salvos neste aparelho.");
+  }
+}
+
+// Envia de uma vez todo o histórico deste aparelho para a planilha (usado na
+// primeira conexão, quando a planilha está vazia). Substitui o conteúdo dela.
+async function enviarTudoParaPlanilha() {
+  if (!apiUrl) return;
+  await apiPost("importarTudo", {
+    clientes: db.clientes,
+    vendas: db.vendas,
+    itensVenda: db.itensVenda,
+    pagamentos: db.pagamentos,
+    estoque: db.estoque,
+    configuracoes: db.configuracoes,
+  });
+}
+
+/* ==========================================================================
+   3. DADOS INICIAIS (SEED) — criados apenas na primeira execução
+   ========================================================================== */
+
+const DEFAULT_CONFIGURACOES = {
+  nomeNegocio: "Cowboy Salgados",
+  precoSalgado: 9.9,
+  precoRefrigerante: 4.5,
+  precoTrufa: 7.5,
+  precoKit4Trufas: 24.0,
+  metaDiaria: 80,
+  estoqueMinimoSalgado: 20,
+};
+
+function buildSeedDB() {
+  const now = new Date();
+  const isoDaysAgo = (days, hours = 10) => {
+    const d = new Date(now);
+    d.setDate(d.getDate() - days);
+    d.setHours(hours, 0, 0, 0);
+    return d.toISOString();
+  };
+
+  const configuracoes = { ...DEFAULT_CONFIGURACOES };
+
+  const produtos = [
+    { id: PRODUTO_IDS.SALGADO, nome: "Salgado", tipo: "salgado", unidade: "un", icon: "🥟" },
+    { id: PRODUTO_IDS.REFRIGERANTE, nome: "Refrigerante 200ml", tipo: "refrigerante", unidade: "un", icon: "🥤" },
+    { id: PRODUTO_IDS.TRUFA, nome: "Trufa", tipo: "trufa", unidade: "un", icon: "🍫" },
+  ];
+
+  const estoque = [
+    { produtoId: PRODUTO_IDS.SALGADO, quantidadeAtual: 52, estoqueMinimo: 20 },
+    { produtoId: PRODUTO_IDS.REFRIGERANTE, quantidadeAtual: 18, estoqueMinimo: 12 },
+    { produtoId: PRODUTO_IDS.TRUFA, quantidadeAtual: 30, estoqueMinimo: 10 },
+  ];
+
+  const clientes = [
+    {
+      id: CLIENTE_AVULSO_ID,
+      nome: "Cliente Avulso (Balcão)",
+      telefone: "",
+      observacao: "Venda rápida sem cadastro completo.",
+      fixo: true,
+      createdAt: isoDaysAgo(30),
+    },
+    { id: generateId("cli"), nome: "João", telefone: "11987654321", observacao: "", createdAt: isoDaysAgo(20) },
+    { id: generateId("cli"), nome: "Maria", telefone: "11976543210", observacao: "", createdAt: isoDaysAgo(15) },
+    { id: generateId("cli"), nome: "Pedro", telefone: "11965432109", observacao: "", createdAt: isoDaysAgo(10) },
+  ];
+
+  const joaoId = clientes[1].id;
+  const mariaId = clientes[2].id;
+  const pedroId = clientes[3].id;
+
+  const vendas = [];
+  const itensVenda = [];
+  const pagamentos = [];
+
+  function addVendaSeed({
+    clienteId,
+    diasAtras,
+    formaPagamento,
+    itens,
+    statusOverride,
+    valorPagoOverride,
+    previsaoDiasAposVenda, // fiado: quantos dias após a venda o pagamento foi combinado
+    pagoDiasAtras, // se a venda já foi quitada, há quantos dias isso aconteceu
+    quitada, // força a venda como totalmente paga (usado para demonstrar o fluxo completo)
+  }) {
+    const vendaId = generateId("venda");
+    const data = isoDaysAgo(diasAtras);
+    let valorTotal = 0;
+    itens.forEach((item) => {
+      const produto = produtos.find((p) => p.id === item.produtoId);
+      const valorItem = calcularValorItem(produto, item.quantidade, configuracoes);
+      valorTotal += valorItem;
+      itensVenda.push({
+        id: generateId("item"),
+        vendaId,
+        produtoId: item.produtoId,
+        quantidade: item.quantidade,
+        valorTotal: valorItem,
+      });
+    });
+    valorTotal = Math.round(valorTotal * 100) / 100;
+
+    const isFiado = formaPagamento === "fiado";
+    let valorPago = valorPagoOverride != null ? valorPagoOverride : isFiado ? 0 : valorTotal;
+    if (quitada) valorPago = valorTotal;
+    const valorRestante = Math.round((valorTotal - valorPago) * 100) / 100;
+    const status = statusOverride || (valorRestante <= 0 ? "pago" : valorPago > 0 ? "parcial" : "aberto");
+
+    const dataPrevisaoPagamento =
+      isFiado && previsaoDiasAposVenda != null
+        ? toDateKey(new Date(new Date(data).getTime() + previsaoDiasAposVenda * 86400000))
+        : null;
+    // "dataPagamento" só faz sentido para fiado (marca a quitação); à vista já
+    // nasce paga no ato da venda, então não precisa desse registro à parte.
+    const dataPagamento = isFiado && status === "pago" ? (pagoDiasAtras != null ? isoDaysAgo(pagoDiasAtras) : data) : null;
+
+    const venda = {
+      id: vendaId,
+      clienteId,
+      data,
+      formaPagamento,
+      valorTotal,
+      valorPago: Math.round(valorPago * 100) / 100,
+      valorRestante,
+      status,
+      dataPrevisaoPagamento,
+      dataPagamento,
+    };
+    vendas.push(venda);
+
+    return venda;
+  }
+
+  // Venda à vista paga hoje
+  addVendaSeed({
+    clienteId: mariaId,
+    diasAtras: 0,
+    formaPagamento: "pix",
+    itens: [
+      { produtoId: PRODUTO_IDS.SALGADO, quantidade: 3 },
+      { produtoId: PRODUTO_IDS.REFRIGERANTE, quantidade: 2 },
+    ],
+  });
+
+  // Venda fiada hoje (em aberto), com previsão de pagamento em 7 dias
+  addVendaSeed({
+    clienteId: joaoId,
+    diasAtras: 0,
+    formaPagamento: "fiado",
+    itens: [
+      { produtoId: PRODUTO_IDS.SALGADO, quantidade: 4 },
+      { produtoId: PRODUTO_IDS.TRUFA, quantidade: 4 },
+    ],
+    previsaoDiasAposVenda: 7,
+  });
+
+  // Venda fiada antiga, parcialmente paga — previsão já vencida (demonstra "atrasado")
+  addVendaSeed({
+    clienteId: pedroId,
+    diasAtras: 12,
+    formaPagamento: "fiado",
+    itens: [{ produtoId: PRODUTO_IDS.SALGADO, quantidade: 8 }],
+    valorPagoOverride: 40,
+    previsaoDiasAposVenda: 5,
+  });
+  pagamentos.push({
+    id: generateId("pag"),
+    clienteId: pedroId,
+    valor: 40,
+    formaPagamento: "dinheiro",
+    data: isoDaysAgo(3),
+  });
+
+  // Venda fiada antiga, em aberto, SEM previsão cadastrada — demonstra a
+  // regra de compatibilidade (registros antigos usam o critério de +7 dias).
+  addVendaSeed({
+    clienteId: joaoId,
+    diasAtras: 15,
+    formaPagamento: "fiado",
+    itens: [
+      { produtoId: PRODUTO_IDS.SALGADO, quantidade: 5 },
+      { produtoId: PRODUTO_IDS.REFRIGERANTE, quantidade: 1 },
+    ],
+  });
+
+  // Venda fiada antiga já quitada — some das pendências, mas segue no relatório.
+  const vendaQuitada = addVendaSeed({
+    clienteId: mariaId,
+    diasAtras: 20,
+    formaPagamento: "fiado",
+    itens: [{ produtoId: PRODUTO_IDS.SALGADO, quantidade: 6 }],
+    previsaoDiasAposVenda: 5,
+    pagoDiasAtras: 18,
+    quitada: true,
+  });
+  pagamentos.push({
+    id: generateId("pag"),
+    clienteId: mariaId,
+    vendaId: vendaQuitada.id,
+    valor: vendaQuitada.valorTotal,
+    formaPagamento: "pix",
+    data: vendaQuitada.dataPagamento,
+  });
+
+  // Venda à vista de ontem
+  addVendaSeed({
+    clienteId: mariaId,
+    diasAtras: 1,
+    formaPagamento: "dinheiro",
+    itens: [{ produtoId: PRODUTO_IDS.TRUFA, quantidade: 2 }],
+  });
+
+  // Ajusta estoque para refletir as vendas de exemplo (consumo simulado)
+  itensVenda.forEach((item) => {
+    const registro = estoque.find((e) => e.produtoId === item.produtoId);
+    if (registro) registro.quantidadeAtual = Math.max(0, registro.quantidadeAtual - item.quantidade);
+  });
+  // Repõe para números redondos de demonstração após o consumo do seed
+  estoque.find((e) => e.produtoId === PRODUTO_IDS.SALGADO).quantidadeAtual = 52;
+  estoque.find((e) => e.produtoId === PRODUTO_IDS.REFRIGERANTE).quantidadeAtual = 18;
+  estoque.find((e) => e.produtoId === PRODUTO_IDS.TRUFA).quantidadeAtual = 30;
+
+  return { clientes, produtos, vendas, itensVenda, pagamentos, estoque, configuracoes };
+}
+
+function initDB() {
+  db = loadDB();
+  if (!db) {
+    db = buildSeedDB();
+    saveDB();
+  } else {
+    let precisaSalvar = false;
+    if (!db.configuracoes) {
+      // Autorreparo: uma sincronização antiga com a planilha (antes do fix do
+      // Apps Script) pode ter salvo o banco local sem "configuracoes". Sem
+      // isso o painel Início quebra pra sempre — repõe os padrões pra destravar.
+      db.configuracoes = { ...DEFAULT_CONFIGURACOES };
+      precisaSalvar = true;
+    }
+    // Autorreparo: datas previstas salvas com hora (ex.: vindas da planilha
+    // antes desse fix) quebravam o campo de data nativo ("Data inválida").
+    db.vendas.forEach((v) => {
+      if (v.dataPrevisaoPagamento && !/^\d{4}-\d{2}-\d{2}$/.test(v.dataPrevisaoPagamento)) {
+        v.dataPrevisaoPagamento = normalizarDataChave(v.dataPrevisaoPagamento);
+        precisaSalvar = true;
+      }
+    });
+    if (precisaSalvar) saveDB();
+  }
+}
+
+function resetToSeed() {
+  db = buildSeedDB();
+  saveDB();
+}
+
+// Usado por "⚠️ Apagar todos os dados": zera de verdade (sem repor vendas e
+// pagamentos de demonstração). O modo de exemplo (buildSeedDB) só faz
+// sentido na primeiríssima abertura do app, nunca depois de já ter dados
+// reais — repor vendas fictícias aqui é o que fazia sobrar valor em
+// "Recebimentos" mesmo depois de apagar tudo.
+function buildEmptyDB() {
+  return {
+    clientes: [
+      {
+        id: CLIENTE_AVULSO_ID,
+        nome: "Cliente Avulso (Balcão)",
+        telefone: "",
+        observacao: "Venda rápida sem cadastro completo.",
+        fixo: true,
+        createdAt: new Date().toISOString(),
+      },
+    ],
+    produtos: [
+      { id: PRODUTO_IDS.SALGADO, nome: "Salgado", tipo: "salgado", unidade: "un", icon: "🥟" },
+      { id: PRODUTO_IDS.REFRIGERANTE, nome: "Refrigerante 200ml", tipo: "refrigerante", unidade: "un", icon: "🥤" },
+      { id: PRODUTO_IDS.TRUFA, nome: "Trufa", tipo: "trufa", unidade: "un", icon: "🍫" },
+    ],
+    vendas: [],
+    itensVenda: [],
+    pagamentos: [],
+    estoque: [
+      { produtoId: PRODUTO_IDS.SALGADO, quantidadeAtual: 0, estoqueMinimo: 20 },
+      { produtoId: PRODUTO_IDS.REFRIGERANTE, quantidadeAtual: 0, estoqueMinimo: 12 },
+      { produtoId: PRODUTO_IDS.TRUFA, quantidadeAtual: 0, estoqueMinimo: 10 },
+    ],
+    configuracoes: { ...DEFAULT_CONFIGURACOES },
+  };
+}
+
+function apagarTudoLocal() {
+  db = buildEmptyDB();
+  saveDB();
+}
+
+/* ==========================================================================
+   4. UTILITÁRIOS
+   ========================================================================== */
+
+function formatCurrency(value) {
+  return (Number(value) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function formatDateShort(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString("pt-BR");
+}
+
+// Formata uma data "só o dia" (ex.: dataPrevisaoPagamento, 'YYYY-MM-DD').
+// new Date('YYYY-MM-DD') interpreta como meia-noite UTC, o que pode exibir
+// o dia errado em fusos negativos (Brasil) — por isso montamos a data local
+// a partir dos componentes, em vez de deixar o JS fazer o parse.
+function formatDateOnly(dateKey) {
+  if (!dateKey) return "—";
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("pt-BR");
+}
+
+// A planilha às vezes guarda "dataPrevisaoPagamento" como data de verdade
+// (não texto) e devolve algo como "2026-10-19T03:00:00.000Z" em vez de
+// "2026-10-19" — isso quebra o campo <input type="date"> (exige só
+// AAAA-MM-DD) e aparecia como "Data inválida". Em vez de confiar que a
+// planilha sempre manda o formato certo, normaliza aqui: pega só a parte
+// "AAAA-MM-DD" de qualquer coisa que vier.
+function normalizarDataChave(valor) {
+  if (!valor) return null;
+  const texto = String(valor);
+  const isoMatch = texto.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoMatch) return isoMatch[1];
+  // A planilha às vezes devolve um formato "por extenso" tipo
+  // "Wed Oct 14 2026 00:00:00 GMT-0300 (...)" — deixa o JS reconhecer esse
+  // formato (ele entende nativamente) e remonta a partir dos componentes
+  // locais, em vez de simplesmente descartar a data.
+  const d = new Date(texto);
+  return isNaN(d.getTime()) ? null : toDateKey(d);
+}
+
+// Ciclo do dia pelo horário em que a venda foi lançada: antes do meio-dia é
+// "Manhã", do meio-dia em diante é "Tarde".
+function getCiclo(iso) {
+  return new Date(iso).getHours() < 12 ? "Manhã" : "Tarde";
+}
+
+function formatDateTime(iso) {
+  const d = new Date(iso);
+  return `${d.toLocaleDateString("pt-BR")} ${d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function toDateKey(dateLike) {
+  const d = new Date(dateLike);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function onlyDigits(str) {
+  // O telefone pode vir como número (não texto) quando o cliente é digitado
+  // direto na planilha do Google — por isso força a conversão pra string.
+  return String(str || "").replace(/\D/g, "");
+}
+
+function formatPhone(str) {
+  const digits = onlyDigits(str);
+  if (digits.length === 11) return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7)}`;
+  if (digits.length === 10) return `(${digits.slice(0, 2)}) ${digits.slice(2, 6)}-${digits.slice(6)}`;
+  return str || "—";
+}
+
+function daysBetween(isoDate, reference = new Date()) {
+  const ms = reference.getTime() - new Date(isoDate).getTime();
+  return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+
+function addDays(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+// Vencimentos fixos do negócio: dia 15, 20 ou 30 do mês. Devolve a próxima
+// ocorrência futura (se hoje já é o dia ou passou, vai pro mês seguinte).
+function proximoDiaFixo(dia) {
+  if (dia === "hoje") return toDateKey(new Date());
+  const hoje = new Date();
+  const mes = hoje.getDate() >= dia ? hoje.getMonth() + 1 : hoje.getMonth();
+  return toDateKey(new Date(hoje.getFullYear(), mes, dia));
+}
+
+function diaFixoDoBotao(btn) {
+  return btn.dataset.diaFixo === "hoje" ? "hoje" : Number(btn.dataset.diaFixo);
+}
+
+// Data sugerida de largada: o vencimento fixo mais próximo.
+function dataPrevisaoPadrao() {
+  return [5, 15, 20, 30].map(proximoDiaFixo).sort()[0];
+}
+
+// Segunda-feira 00:00 da semana que contém "date" — para este sistema a
+// semana começa na segunda e termina no domingo (seção 11 do briefing).
+function getMondayOfWeek(date) {
+  const d = new Date(date);
+  const dia = d.getDay(); // 0=domingo, 1=segunda, ... 6=sábado
+  const diff = dia === 0 ? -6 : 1 - dia;
+  d.setDate(d.getDate() + diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/* ==========================================================================
+   5. CÁLCULOS DE DOMÍNIO
+   ========================================================================== */
+
+// Calcula o valor de uma linha de produto, aplicando a promoção de kit de 4
+// trufas sempre que for a combinação mais vantajosa (kits inteiros + avulsas).
+function calcularValorItem(produto, quantidade, config = db.configuracoes) {
+  if (produto.tipo === "trufa") {
+    const kits = Math.floor(quantidade / 4);
+    const avulsas = quantidade % 4;
+    return kits * config.precoKit4Trufas + avulsas * config.precoTrufa;
+  }
+  const preco = produto.tipo === "salgado" ? config.precoSalgado : config.precoRefrigerante;
+  return preco * quantidade;
+}
+
+function precoUnitario(produto, config = db.configuracoes) {
+  if (produto.tipo === "salgado") return config.precoSalgado;
+  if (produto.tipo === "refrigerante") return config.precoRefrigerante;
+  return config.precoTrufa;
+}
+
+function getProduto(id) {
+  return db.produtos.find((p) => p.id === id);
+}
+
+function getCliente(id) {
+  return db.clientes.find((c) => c.id === id);
+}
+
+function getEstoque(produtoId) {
+  return db.estoque.find((e) => e.produtoId === produtoId);
+}
+
+// Soma do que um cliente ainda deve (apenas vendas fiado com saldo em aberto).
+function calcularSaldoCliente(clienteId, vendas = db.vendas) {
+  return vendas
+    .filter((v) => v.clienteId === clienteId && v.formaPagamento === "fiado")
+    .reduce((sum, v) => sum + v.valorRestante, 0);
+}
+
+function totalCompradoCliente(clienteId) {
+  return db.vendas.filter((v) => v.clienteId === clienteId).reduce((sum, v) => sum + v.valorTotal, 0);
+}
+
+function totalPagoCliente(clienteId) {
+  const pagoNaHora = db.vendas
+    .filter((v) => v.clienteId === clienteId && v.formaPagamento !== "fiado")
+    .reduce((sum, v) => sum + v.valorPago, 0);
+  const pagoDepois = db.vendas
+    .filter((v) => v.clienteId === clienteId && v.formaPagamento === "fiado")
+    .reduce((sum, v) => sum + v.valorPago, 0);
+  return pagoNaHora + pagoDepois;
+}
+
+// Status visual do cliente conforme legenda de emojis (seção 10 do briefing).
+function calcularStatusCliente(clienteId, vendas = db.vendas) {
+  const saldo = calcularSaldoCliente(clienteId, vendas);
+  if (saldo <= 0.004) return { emoji: "🟢", label: "Pago" };
+  const vendasFiado = vendas.filter((v) => v.clienteId === clienteId && v.formaPagamento === "fiado");
+  const houvePagamentoParcial = vendasFiado.some((v) => v.valorPago > 0);
+  if (houvePagamentoParcial) return { emoji: "🟡", label: "Parcialmente pago" };
+  return { emoji: "🔴", label: "Em aberto" };
+}
+
+// Status padronizado do pagamento de uma venda: AVISTA / FIADO_PENDENTE /
+// FIADO_PAGO internamente, com rótulo amigável para a interface.
+// "parcial" (pagamento parcial já registrado) continua contando como
+// FIADO_PENDENTE — a venda só sai das pendências quando fica 100% paga.
+function getStatusPagamento(venda) {
+  if (venda.formaPagamento === "doacao") return { code: "DOADO", label: "Doado", emoji: "🎁" };
+  if (venda.formaPagamento !== "fiado") return { code: "AVISTA", label: "À Vista", emoji: "🟢" };
+  if (venda.status === "pago") return { code: "FIADO_PAGO", label: "Fiado - Pago", emoji: "🟢" };
+  if (venda.status === "parcial") return { code: "FIADO_PENDENTE", label: "Fiado - Pendente", emoji: "🟡" };
+  return { code: "FIADO_PENDENTE", label: "Fiado - Pendente", emoji: "🔴" };
+}
+
+// Mantida por compatibilidade com o restante da interface (mesmo resultado).
+function vendaStatusBadge(venda) {
+  return getStatusPagamento(venda);
+}
+
+// Uma venda fiado pendente cuja previsão de pagamento já passou. Isso é só
+// um destaque visual — nunca altera o status da venda automaticamente.
+function isVendaAtrasada(venda) {
+  if (venda.formaPagamento !== "fiado" || venda.status === "pago") return false;
+  if (venda.dataPrevisaoPagamento) {
+    const hoje = new Date();
+    hoje.setHours(0, 0, 0, 0);
+    return new Date(`${venda.dataPrevisaoPagamento}T00:00:00`) < hoje;
+  }
+  return daysBetween(venda.data) > 7; // vendas antigas sem previsão cadastrada
+}
+
+// Filtro de turno global (Todos / Manhã / Tarde), pelo horário do lançamento.
+// Só vale pra o que é exibido (painéis, listas, relatório) — as operações
+// (registrar pagamento, usar crédito, perfil do cliente) sempre veem tudo.
+function noTurno(iso) {
+  return ui.turno === "todos" || getCiclo(iso) === ui.turno;
+}
+
+function vendasDoTurno() {
+  return db.vendas.filter((v) => noTurno(v.data));
+}
+
+function pagamentosDoTurno() {
+  return db.pagamentos.filter((p) => noTurno(p.data));
+}
+
+function getVendasDoDia(referenceDate = new Date()) {
+  const key = toDateKey(referenceDate);
+  return vendasDoTurno().filter((v) => toDateKey(v.data) === key);
+}
+
+function getItensDeVenda(vendaId) {
+  return db.itensVenda.filter((i) => i.vendaId === vendaId);
+}
+
+// Total de salgados vendidos em uma data (usado para a meta diária).
+function getQuantidadeSalgadosNaData(referenceDate = new Date()) {
+  // Doação não é venda: não conta pra meta de vendas.
+  const vendasDia = getVendasDoDia(referenceDate).filter((v) => v.formaPagamento !== "doacao");
+  const idsVendasDia = new Set(vendasDia.map((v) => v.id));
+  return db.itensVenda
+    .filter((i) => idsVendasDia.has(i.vendaId) && getProduto(i.produtoId).tipo === "salgado")
+    .reduce((sum, i) => sum + i.quantidade, 0);
+}
+
+function getAlertasEstoque() {
+  return db.estoque
+    .filter((e) => e.quantidadeAtual < e.estoqueMinimo)
+    .map((e) => ({ ...e, produto: getProduto(e.produtoId) }));
+}
+
+// À vista = dinheiro que entra na hora da venda. Recebido de fiado = dívida
+// antiga sendo quitada agora. São coisas diferentes — nunca somar as duas
+// num "recebimentos do dia" só, senão parece que a venda de hoje foi maior
+// do que realmente foi.
+function getVistaHoje(referenceDate = new Date()) {
+  const key = toDateKey(referenceDate);
+  return vendasDoTurno()
+    .filter((v) => v.formaPagamento !== "fiado" && toDateKey(v.data) === key)
+    .reduce((sum, v) => sum + valorEmDinheiro(v), 0);
+}
+
+function getRecebidoFiadoHoje(referenceDate = new Date()) {
+  const key = toDateKey(referenceDate);
+  return pagamentosDoTurno()
+    .filter((p) => toDateKey(p.data) === key && p.vendaId !== CREDITO_USADO_ID && p.vendaId !== CREDITO_ID)
+    .reduce((sum, p) => sum + p.valor, 0);
+}
+
+function getFiadoEmAbertoTotal() {
+  return vendasDoTurno().filter((v) => v.formaPagamento === "fiado").reduce((sum, v) => sum + v.valorRestante, 0);
+}
+
+// Vendas fiado pendentes cuja data prevista de pagamento já passou (ou nunca
+// foi definida) — usado pro alerta gritante do painel Início.
+function getVendasFiadoAtrasadas() {
+  return vendasDoTurno().filter((v) => v.formaPagamento === "fiado" && v.status !== "pago" && isVendaAtrasada(v));
+}
+
+/* ==========================================================================
+   6. OPERAÇÕES DE DADOS (escrita)
+   ========================================================================== */
+
+function criarCliente({ nome, telefone, observacao }) {
+  const cliente = {
+    id: generateId("cli"),
+    nome: nome.trim(),
+    telefone: onlyDigits(telefone),
+    observacao: (observacao || "").trim(),
+    credito: 0,
+    createdAt: new Date().toISOString(),
+  };
+  db.clientes.push(cliente);
+  saveDB();
+  syncInBackground("upsert", { sheet: "Clientes", row: cliente });
+  return cliente;
+}
+
+function editarCliente(clienteId, { nome, telefone, observacao }) {
+  const cliente = getCliente(clienteId);
+  if (!cliente) return;
+  cliente.nome = nome.trim();
+  cliente.telefone = onlyDigits(telefone);
+  cliente.observacao = (observacao || "").trim();
+  saveDB();
+  syncInBackground("upsert", { sheet: "Clientes", row: cliente });
+}
+
+// Remove o cliente e tudo que está vinculado a ele (vendas, itens dessas
+// vendas e pagamentos) — tanto localmente quanto na planilha.
+function excluirCliente(clienteId) {
+  const vendasDoCliente = db.vendas.filter((v) => v.clienteId === clienteId);
+  const vendaIds = new Set(vendasDoCliente.map((v) => v.id));
+  const itensDoCliente = db.itensVenda.filter((i) => vendaIds.has(i.vendaId));
+  const pagamentosDoCliente = db.pagamentos.filter((p) => p.clienteId === clienteId);
+
+  // As vendas dele somem do sistema — então o que elas tiraram do estoque
+  // volta, igual a excluir uma venda (senão o estoque nunca bate com as vendas).
+  const estoqueDelta = deltasDeEstoque(itensDoCliente, 1);
+  itensDoCliente.forEach((item) => {
+    const registro = getEstoque(item.produtoId);
+    if (registro) registro.quantidadeAtual += item.quantidade;
+  });
+
+  db.itensVenda = db.itensVenda.filter((i) => !vendaIds.has(i.vendaId));
+  db.vendas = db.vendas.filter((v) => v.clienteId !== clienteId);
+  db.pagamentos = db.pagamentos.filter((p) => p.clienteId !== clienteId);
+  db.clientes = db.clientes.filter((c) => c.id !== clienteId);
+  saveDB();
+
+  // Um único pedido (em vez de vários em paralelo) — o Apps Script não
+  // garante ordem/atomicidade entre chamadas concorrentes na mesma aba.
+  syncInBackground("excluirCliente", {
+    clienteId,
+    itemIds: itensDoCliente.map((i) => i.id),
+    vendaIds: vendasDoCliente.map((v) => v.id),
+    pagamentoIds: pagamentosDoCliente.map((p) => p.id),
+    estoqueDelta,
+  });
+}
+
+// Registra uma venda completa: cria a venda, os itens, abate o estoque
+// e (se fiado) já deixa o saldo devedor do cliente atualizado.
+function registrarVenda({ clienteId, itens, formaPagamento, dataPrevisaoPagamento, desconto = 0, descricao = "", usarCredito = false, valorRecebido = null }) {
+  const vendaId = generateId("venda");
+  const data = new Date().toISOString(); // registra automaticamente data e hora da venda
+
+  let valorTotal = 0;
+  // Os itens guardam sempre o valor de tabela (cadastrado) — o desconto
+  // só é aplicado no total da venda, não item a item.
+  const itensRegistrados = itens.map((item) => {
+    const produto = getProduto(item.produtoId);
+    const valorItem = calcularValorItem(produto, item.quantidade);
+    valorTotal += valorItem;
+    return { id: generateId("item"), vendaId, produtoId: item.produtoId, quantidade: item.quantidade, valorTotal: valorItem };
+  });
+
+  // Doação: sai do estoque mas não gera cobrança (valor da venda = 0). Os
+  // itens guardam o valor de tabela, que é o "quanto foi doado".
+  const isDoacao = formaPagamento === "doacao";
+  if (isDoacao) {
+    desconto = 0;
+    usarCredito = false;
+    valorRecebido = null;
+  }
+  valorTotal = isDoacao ? 0 : Math.max(0, arred2(valorTotal - (desconto || 0)));
+  const isFiado = formaPagamento === "fiado";
+
+  // Caixa positivo do cliente: o crédito pode abater esta venda (à vista ou
+  // fiado), e se ele entregar MAIS do que precisa à vista, a sobra vira crédito.
+  const pg = calcularPagamentoVenda({ clienteId, totalFinal: valorTotal, usarCredito, valorRecebido, isFiado });
+
+  const venda = {
+    id: vendaId,
+    clienteId,
+    data,
+    formaPagamento,
+    valorTotal,
+    valorPago: isFiado ? pg.creditoAplicado : valorTotal,
+    valorRestante: isFiado ? arred2(valorTotal - pg.creditoAplicado) : 0,
+    status: isFiado ? (valorTotal - pg.creditoAplicado <= 0.004 ? "pago" : pg.creditoAplicado > 0 ? "parcial" : "aberto") : "pago",
+    ...(descricao && descricao.trim() ? { descricao: descricao.trim() } : {}),
+    dataPrevisaoPagamento: isFiado ? dataPrevisaoPagamento || null : null,
+    dataPagamento: isFiado && valorTotal - pg.creditoAplicado <= 0.004 ? data : null,
+  };
+
+  const pagamentosExtras = [];
+  if (pg.creditoAplicado > 0) {
+    pagamentosExtras.push({ id: `pagcu-${vendaId}`, clienteId, vendaId: CREDITO_USADO_ID, valor: pg.creditoAplicado, formaPagamento: "credito", data });
+  }
+  if (pg.sobra > 0) {
+    pagamentosExtras.push({ id: `pagcr-${vendaId}`, clienteId, vendaId: CREDITO_ID, valor: pg.sobra, formaPagamento, data });
+  }
+  db.pagamentos.push(...pagamentosExtras);
+  const clienteCredito =
+    pg.creditoAplicado > 0 || pg.sobra > 0 ? ajustarCreditoCliente(clienteId, pg.sobra - pg.creditoAplicado) : null;
+
+  db.vendas.push(venda);
+  db.itensVenda.push(...itensRegistrados);
+
+  itens.forEach((item) => {
+    const estoqueItem = getEstoque(item.produtoId);
+    if (estoqueItem) estoqueItem.quantidadeAtual = Math.max(0, estoqueItem.quantidadeAtual - item.quantidade);
+  });
+
+  saveDB();
+
+  syncSequencial([
+    ["registrarVenda", { venda, itens: itensRegistrados, estoqueDelta: deltasDeEstoque(itens, -1) }],
+    ...pagamentosExtras.map((row) => ["upsert", { sheet: "Pagamentos", row }]),
+    ...(clienteCredito ? [["upsert", { sheet: "Clientes", row: clienteCredito }]] : []),
+  ]);
+
+  return venda;
+}
+
+// Variação de estoque por produto (sinal -1 = saiu, +1 = voltou). A planilha soma
+// isso ao valor que ela tem na hora, em vez de receber o número deste aparelho.
+function deltasDeEstoque(itens, sinal) {
+  const porProduto = new Map();
+  itens.forEach((i) => porProduto.set(i.produtoId, (porProduto.get(i.produtoId) || 0) + i.quantidade));
+  return [...porProduto.entries()].map(([produtoId, qtd]) => ({
+    produtoId,
+    delta: sinal * qtd,
+    estoqueMinimo: getEstoque(produtoId)?.estoqueMinimo || 0,
+  }));
+}
+
+function arred2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+// Quanto do total sai do crédito do cliente, quanto ele ainda precisa pagar
+// agora, e quanto da entrega dele passa do necessário (vira crédito novo).
+function calcularPagamentoVenda({ clienteId, totalFinal, usarCredito, valorRecebido, isFiado }) {
+  const creditoDisponivel = clienteId === CLIENTE_AVULSO_ID ? 0 : getCreditoCliente(clienteId);
+  const creditoAplicado = usarCredito ? arred2(Math.min(creditoDisponivel, totalFinal)) : 0;
+  const aReceberAgora = arred2(totalFinal - creditoAplicado);
+  const sobra =
+    !isFiado && clienteId !== CLIENTE_AVULSO_ID && valorRecebido != null && valorRecebido > aReceberAgora
+      ? arred2(valorRecebido - aReceberAgora)
+      : 0;
+  return { creditoDisponivel, creditoAplicado, aReceberAgora, sobra };
+}
+
+// Da parte paga de uma venda, quanto foi pago com crédito (não é dinheiro novo).
+function creditoUsadoNaVenda(vendaId) {
+  const p = db.pagamentos.find((x) => x.id === `pagcu-${vendaId}`);
+  return p ? p.valor : 0;
+}
+
+// Dinheiro/cartão que realmente entrou numa venda à vista (sem a parte do crédito).
+function valorEmDinheiro(v) {
+  return Math.max(0, arred2(v.valorPago - creditoUsadoNaVenda(v.id)));
+}
+
+function getCreditoRecebidoHoje(referenceDate = new Date()) {
+  const key = toDateKey(referenceDate);
+  return pagamentosDoTurno()
+    .filter((p) => toDateKey(p.data) === key && p.vendaId === CREDITO_ID)
+    .reduce((sum, p) => sum + p.valor, 0);
+}
+
+// Soma do saldo positivo de todos os clientes (o "caixa positivo" total).
+function getCreditoTotalEmCaixa() {
+  return Math.max(0, arred2(db.clientes.reduce((s, c) => s + getCreditoCliente(c.id), 0)));
+}
+
+// Entrada de crédito a qualquer momento (adiantamento/depósito), sem precisar de venda.
+function adicionarCreditoCliente(clienteId, valor, formaPagamento) {
+  const row = { id: generateId("pag"), clienteId, vendaId: CREDITO_ID, valor: arred2(valor), formaPagamento, data: new Date().toISOString() };
+  db.pagamentos.push(row);
+  const cliente = ajustarCreditoCliente(clienteId, row.valor);
+  saveDB();
+  syncSequencial([
+    ["upsert", { sheet: "Pagamentos", row }],
+    ...(cliente ? [["upsert", { sheet: "Clientes", row: cliente }]] : []),
+  ]);
+  return row;
+}
+
+// Marcas usadas na coluna "vendaId" da aba Pagamentos pra guardar o saldo
+// positivo do cliente sem precisar de coluna nova na planilha:
+//  - CREDITO: sobra de um pagamento maior que a dívida (entra como crédito)
+//  - CREDITO-USADO: crédito que já foi abatido de dívidas depois
+const CREDITO_ID = "CREDITO";
+const CREDITO_USADO_ID = "CREDITO-USADO";
+
+// O saldo atual fica na coluna "credito" da aba Clientes da planilha (dá pra
+// ver e apagar direto lá). As linhas CREDITO/CREDITO-USADO em Pagamentos
+// seguem só como histórico (relatórios), não decidem mais o saldo.
+function getCreditoCliente(clienteId) {
+  const cliente = getCliente(clienteId);
+  if (!cliente) return 0;
+  // Planilha ainda sem a coluna "credito" (Apps Script antigo): usa o
+  // histórico de entradas/saídas de crédito até a coluna passar a existir.
+  if (cliente.credito === undefined || cliente.credito === null) return creditoPeloHistorico(clienteId);
+  return Math.max(0, arred2(Number(cliente.credito) || 0));
+}
+
+function creditoPeloHistorico(clienteId) {
+  const soma = (marca) =>
+    db.pagamentos.filter((p) => p.clienteId === clienteId && p.vendaId === marca).reduce((s, p) => s + p.valor, 0);
+  return Math.max(0, arred2(soma(CREDITO_ID) - soma(CREDITO_USADO_ID)));
+}
+
+// Soma (ou subtrai, se negativo) do saldo do cliente. Devolve a linha do
+// cliente já atualizada, pronta pra ir pra planilha.
+function ajustarCreditoCliente(clienteId, delta) {
+  const cliente = getCliente(clienteId);
+  if (!cliente) return null;
+  if (cliente.credito === undefined || cliente.credito === null) {
+    // Quem chama já atualizou o histórico de crédito, então ele já reflete o novo saldo.
+    cliente.credito = creditoPeloHistorico(clienteId);
+  } else {
+    cliente.credito = Math.max(0, arred2((Number(cliente.credito) || 0) + delta));
+  }
+  return cliente;
+}
+
+// Corrige um crédito lançado por engano: tira "valor" do saldo e também das
+// entradas de crédito mais recentes do histórico (assim os relatórios deixam
+// de contar esse valor como crédito recebido). Devolve quanto foi removido.
+function removerCreditoCliente(clienteId, valor) {
+  const remover = Math.min(arred2(valor), getCreditoCliente(clienteId));
+  if (remover <= 0) return 0;
+
+  let restante = remover;
+  const acoes = [];
+  const entradas = db.pagamentos
+    .filter((p) => p.clienteId === clienteId && p.vendaId === CREDITO_ID)
+    .sort((a, b) => new Date(b.data) - new Date(a.data));
+  for (const p of entradas) {
+    if (restante <= 0) break;
+    const tira = Math.min(restante, p.valor);
+    restante = arred2(restante - tira);
+    p.valor = arred2(p.valor - tira);
+    if (p.valor <= 0) {
+      db.pagamentos = db.pagamentos.filter((x) => x !== p);
+      acoes.push(["deletar", { sheet: "Pagamentos", id: p.id }]);
+    } else {
+      acoes.push(["upsert", { sheet: "Pagamentos", row: p }]);
+    }
+  }
+
+  const cliente = ajustarCreditoCliente(clienteId, -remover);
+  saveDB();
+  syncSequencial([...acoes, ["upsert", { sheet: "Clientes", row: cliente }]]);
+  return remover;
+}
+
+// Abate "valor" das vendas fiado em aberto do cliente, as mais antigas
+// primeiro (FIFO). Devolve as vendas que mudaram.
+function aplicarPagamentoFifo(clienteId, valor) {
+  let restante = valor;
+  const vendasAbertas = db.vendas
+    .filter((v) => v.clienteId === clienteId && v.formaPagamento === "fiado" && v.valorRestante > 0)
+    .sort((a, b) => new Date(a.data) - new Date(b.data));
+
+  const vendasAlteradas = [];
+  for (const venda of vendasAbertas) {
+    if (restante <= 0) break;
+    const abate = Math.min(restante, venda.valorRestante);
+    venda.valorPago = Math.round((venda.valorPago + abate) * 100) / 100;
+    venda.valorRestante = Math.round((venda.valorRestante - abate) * 100) / 100;
+    if (venda.valorRestante < 0.01) venda.valorRestante = 0;
+    venda.status = venda.valorRestante <= 0 ? "pago" : "parcial";
+    if (venda.status === "pago" && !venda.dataPagamento) venda.dataPagamento = new Date().toISOString();
+    restante -= abate;
+    vendasAlteradas.push(venda);
+  }
+  return vendasAlteradas;
+}
+
+// Registra um pagamento. O que cobrir a dívida abate as vendas (FIFO); se o
+// cliente pagar MAIS do que deve, a sobra vira saldo positivo (crédito).
+function registrarPagamento(clienteId, valorInformado, formaPagamento) {
+  const valorRecebido = Math.round(Math.max(valorInformado, 0) * 100) / 100;
+  const aplicado = Math.min(valorRecebido, calcularSaldoCliente(clienteId));
+  const sobra = Math.round((valorRecebido - aplicado) * 100) / 100;
+  const agora = new Date().toISOString();
+
+  const vendasAlteradas = aplicado > 0 ? aplicarPagamentoFifo(clienteId, aplicado) : [];
+  const acoes = [];
+
+  if (aplicado > 0) {
+    const pagamento = { id: generateId("pag"), clienteId, valor: aplicado, formaPagamento, data: agora };
+    db.pagamentos.push(pagamento);
+    acoes.push(["registrarPagamento", { pagamento, vendasAtualizadas: vendasAlteradas }]);
+  }
+  if (sobra > 0) {
+    const credito = { id: generateId("pag"), clienteId, vendaId: CREDITO_ID, valor: sobra, formaPagamento, data: agora };
+    db.pagamentos.push(credito);
+    acoes.push(["upsert", { sheet: "Pagamentos", row: credito }]);
+    const cliente = ajustarCreditoCliente(clienteId, sobra);
+    if (cliente) acoes.push(["upsert", { sheet: "Clientes", row: cliente }]);
+  }
+  saveDB();
+  syncSequencial(acoes);
+
+  return { valorAplicado: aplicado, sobra, valorRecebido };
+}
+
+// Usa o saldo positivo do cliente pra abater dívidas fiado em aberto.
+function usarCreditoCliente(clienteId) {
+  const usar = Math.min(getCreditoCliente(clienteId), calcularSaldoCliente(clienteId));
+  if (usar <= 0) return 0;
+  const vendasAlteradas = aplicarPagamentoFifo(clienteId, usar);
+  const pagamento = {
+    id: generateId("pag"),
+    clienteId,
+    vendaId: CREDITO_USADO_ID,
+    valor: usar,
+    formaPagamento: "credito",
+    data: new Date().toISOString(),
+  };
+  db.pagamentos.push(pagamento);
+  const cliente = ajustarCreditoCliente(clienteId, -usar);
+  saveDB();
+  syncSequencial([
+    ["registrarPagamento", { pagamento, vendasAtualizadas: vendasAlteradas }],
+    ...(cliente ? [["upsert", { sheet: "Clientes", row: cliente }]] : []),
+  ]);
+  return usar;
+}
+
+// Corrige a data prevista de pagamento de uma venda fiado já registrada.
+function editarPrevisaoPagamento(vendaId, novaData) {
+  const venda = db.vendas.find((v) => v.id === vendaId);
+  if (!venda) return;
+  venda.dataPrevisaoPagamento = novaData || null;
+  saveDB();
+  syncInBackground("upsert", { sheet: "Vendas", row: venda });
+}
+
+// Corrige o valor total de uma venda já registrada (ex.: erro de digitação
+// no momento da venda). Recalcula o que falta pagar mantendo o valor já
+// pago intacto; à vista sempre fica com a venda 100% paga no novo valor.
+function editarValorTotalVenda(vendaId, novoValorTotal) {
+  const venda = db.vendas.find((v) => v.id === vendaId);
+  if (!venda) return;
+  venda.valorTotal = Math.round(novoValorTotal * 100) / 100;
+  if (venda.formaPagamento === "fiado") {
+    venda.valorRestante = Math.max(0, Math.round((venda.valorTotal - venda.valorPago) * 100) / 100);
+    venda.status = venda.valorRestante <= 0 ? "pago" : venda.valorPago > 0 ? "parcial" : "aberto";
+  } else {
+    venda.valorPago = venda.valorTotal;
+    venda.valorRestante = 0;
+  }
+  saveDB();
+  syncInBackground("upsert", { sheet: "Vendas", row: venda });
+}
+
+// Apaga a venda e seus itens, devolvendo as quantidades vendidas pro
+// estoque (a venda está sendo desfeita, não só removida do histórico).
+function excluirVenda(vendaId) {
+  const venda = db.vendas.find((v) => v.id === vendaId);
+  if (!venda) return;
+  const itens = db.itensVenda.filter((i) => i.vendaId === vendaId);
+
+  itens.forEach((item) => {
+    const registro = getEstoque(item.produtoId);
+    if (registro) registro.quantidadeAtual += item.quantidade;
+  });
+
+  // Crédito usado/sobra gerada NESSA venda voltam ao que eram antes dela.
+  const pagamentosLigados = db.pagamentos.filter((p) => p.id === `pagcu-${vendaId}` || p.id === `pagcr-${vendaId}`);
+  db.pagamentos = db.pagamentos.filter((p) => !pagamentosLigados.includes(p));
+  const deltaCredito = pagamentosLigados.reduce((s, p) => s + (p.id.startsWith("pagcu-") ? p.valor : -p.valor), 0);
+  const clienteCredito = deltaCredito !== 0 ? ajustarCreditoCliente(venda.clienteId, deltaCredito) : null;
+
+  db.itensVenda = db.itensVenda.filter((i) => i.vendaId !== vendaId);
+  db.vendas = db.vendas.filter((v) => v.id !== vendaId);
+  saveDB();
+
+  // Em sequência (esperando cada uma): o Apps Script não garante ordem/atomicidade
+  // entre chamadas concorrentes na mesma aba.
+  syncSequencial([
+    ["excluirVenda", { vendaId, itemIds: itens.map((i) => i.id), estoqueDelta: deltasDeEstoque(itens, 1) }],
+    ...pagamentosLigados.map((p) => ["deletar", { sheet: "Pagamentos", id: p.id }]),
+    ...(clienteCredito ? [["upsert", { sheet: "Clientes", row: clienteCredito }]] : []),
+  ]);
+}
+
+function ajustarEstoque(produtoId, tipoOperacao, quantidade) {
+  const registro = getEstoque(produtoId);
+  if (!registro) return;
+  const antes = registro.quantidadeAtual;
+  if (tipoOperacao === "entrada") registro.quantidadeAtual += quantidade;
+  else if (tipoOperacao === "saida") registro.quantidadeAtual = Math.max(0, registro.quantidadeAtual - quantidade);
+  else if (tipoOperacao === "ajuste") registro.quantidadeAtual = Math.max(0, quantidade);
+  saveDB();
+  if (tipoOperacao === "ajuste") {
+    // "Ajustar" é definir o número certo de propósito (contagem física): grava o valor exato.
+    syncInBackground("upsert", { sheet: "Estoque", row: registro });
+  } else {
+    // Entrada/saída só mandam a variação, pra não apagar vendas feitas em outro aparelho.
+    syncInBackground("ajustarEstoque", {
+      estoqueDelta: [{ produtoId, delta: registro.quantidadeAtual - antes, estoqueMinimo: registro.estoqueMinimo }],
+    });
+  }
+}
+
+function editarEstoqueMinimo(produtoId, novoMinimo) {
+  const registro = getEstoque(produtoId);
+  if (!registro) return;
+  registro.estoqueMinimo = Math.max(0, novoMinimo);
+  saveDB();
+  syncInBackground("estoqueMinimo", { produtoId, estoqueMinimo: registro.estoqueMinimo });
+}
+
+function salvarConfiguracoes(novasConfig) {
+  Object.assign(db.configuracoes, novasConfig);
+  const salgadoEstoque = getEstoque(PRODUTO_IDS.SALGADO);
+  if (salgadoEstoque && novasConfig.estoqueMinimoSalgado != null) {
+    salgadoEstoque.estoqueMinimo = novasConfig.estoqueMinimoSalgado;
+  }
+  saveDB();
+  syncInBackground("saveConfig", { config: db.configuracoes });
+  if (salgadoEstoque && novasConfig.estoqueMinimoSalgado != null) {
+    syncInBackground("estoqueMinimo", { produtoId: PRODUTO_IDS.SALGADO, estoqueMinimo: salgadoEstoque.estoqueMinimo });
+  }
+}
+
+/* ==========================================================================
+   7. RELATÓRIO / FILTROS DE DATA
+   ========================================================================== */
+
+function getPeriodoRange(filtro, customStart, customEnd) {
+  const now = new Date();
+  let start, end;
+
+  if (filtro === "hoje") {
+    start = new Date(now);
+    end = new Date(now);
+  } else if (filtro === "ontem") {
+    start = new Date(now);
+    start.setDate(start.getDate() - 1);
+    end = new Date(start);
+  } else if (filtro === "esta-semana") {
+    start = getMondayOfWeek(now);
+    end = addDays(start, 6);
+  } else if (filtro === "semana-passada") {
+    start = addDays(getMondayOfWeek(now), -7);
+    end = addDays(start, 6);
+  } else if (filtro === "7dias") {
+    start = new Date(now);
+    start.setDate(start.getDate() - 6);
+    end = new Date(now);
+  } else if (filtro === "mes") {
+    start = new Date(now.getFullYear(), now.getMonth(), 1);
+    end = new Date(now);
+  } else if (filtro === "personalizado") {
+    start = new Date(customStart);
+    end = new Date(customEnd);
+  } else {
+    start = new Date(now);
+    end = new Date(now);
+  }
+
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+  return { start, end };
+}
+
+function gerarRelatorio(filtro, customStart, customEnd, opcoes = {}) {
+  const { clienteId, status } = opcoes;
+  const { start, end } = getPeriodoRange(filtro, customStart, customEnd);
+  let vendasPeriodo = vendasDoTurno().filter((v) => {
+    const d = new Date(v.data);
+    return d >= start && d <= end;
+  });
+  if (clienteId) vendasPeriodo = vendasPeriodo.filter((v) => v.clienteId === clienteId);
+  if (status) vendasPeriodo = vendasPeriodo.filter((v) => getStatusPagamento(v).code === status);
+  vendasPeriodo = [...vendasPeriodo].sort((a, b) => new Date(b.data) - new Date(a.data));
+
+  const idsVendas = new Set(vendasPeriodo.map((v) => v.id));
+  const itensPeriodo = db.itensVenda.filter((i) => idsVendas.has(i.vendaId));
+  let pagamentosPeriodo = pagamentosDoTurno().filter((p) => {
+    const d = new Date(p.data);
+    return d >= start && d <= end;
+  });
+  if (clienteId) pagamentosPeriodo = pagamentosPeriodo.filter((p) => p.clienteId === clienteId);
+
+  const somaPorTipo = (tipo) =>
+    itensPeriodo.filter((i) => getProduto(i.produtoId).tipo === tipo).reduce((sum, i) => sum + i.quantidade, 0);
+
+  const vendasVista = vendasPeriodo.filter((v) => v.formaPagamento !== "fiado" && v.formaPagamento !== "doacao");
+  const vendasFiado = vendasPeriodo.filter((v) => v.formaPagamento === "fiado");
+  const vendasDoadas = vendasPeriodo.filter((v) => v.formaPagamento === "doacao");
+
+  // "saldo" = parte da venda paga com o crédito do cliente (não é dinheiro novo).
+  const formasPagamento = { pix: 0, dinheiro: 0, debito: 0, credito: 0, saldo: 0 };
+  vendasVista.forEach((v) => {
+    const emDinheiro = valorEmDinheiro(v);
+    if (emDinheiro > 0) formasPagamento[v.formaPagamento] = (formasPagamento[v.formaPagamento] || 0) + emDinheiro;
+    formasPagamento.saldo += arred2(v.valorPago - emDinheiro);
+  });
+
+  const faturamentoTotal = vendasPeriodo.reduce((sum, v) => sum + v.valorTotal, 0);
+  const valorFiado = vendasFiado.reduce((sum, v) => sum + v.valorTotal, 0);
+  const valorAindaAReceber = vendasFiado.reduce((sum, v) => sum + v.valorRestante, 0);
+  // Separados de propósito: "à vista" é dinheiro que entra na hora da venda;
+  // "recebido fiado" é dívida antiga sendo paga agora — não é a mesma coisa.
+  // Crédito não entra como "recebido de fiado": sobra/depósito vira "crédito
+  // recebido" (caixa positivo) e o crédito usado só reaproveita dinheiro antigo.
+  const valorRecebidoVista = vendasVista.reduce((sum, v) => sum + valorEmDinheiro(v), 0);
+  const soma = (lista) => lista.reduce((sum, p) => sum + p.valor, 0);
+  const valorRecebidoFiado = soma(pagamentosPeriodo.filter((p) => p.vendaId !== CREDITO_ID && p.vendaId !== CREDITO_USADO_ID));
+  const creditoRecebido = soma(pagamentosPeriodo.filter((p) => p.vendaId === CREDITO_ID));
+  const creditoUsado = soma(pagamentosPeriodo.filter((p) => p.vendaId === CREDITO_USADO_ID));
+
+  // Desconto dado no período: os itens sempre guardam o valor de tabela
+  // (cadastrado), então a diferença entre a soma dos itens e o valor final
+  // da venda é exatamente o desconto aplicado — não precisa de um campo à
+  // parte pra isso, só comparar o que foi cadastrado com o que foi cobrado.
+  const catalogoPorVenda = new Map();
+  itensPeriodo.forEach((i) => {
+    catalogoPorVenda.set(i.vendaId, (catalogoPorVenda.get(i.vendaId) || 0) + i.valorTotal);
+  });
+  const descontoTotal = vendasPeriodo
+    .filter((v) => v.formaPagamento !== "doacao")
+    .reduce((sum, v) => {
+      const catalogo = catalogoPorVenda.get(v.id) || 0;
+      return sum + Math.max(0, Math.round((catalogo - v.valorTotal) * 100) / 100);
+    }, 0);
+  // Doação não é desconto: vai pra uma linha própria (valor de tabela doado).
+  const doacaoTotal = vendasDoadas.reduce((sum, v) => sum + (catalogoPorVenda.get(v.id) || 0), 0);
+  const doacaoQuantidade = itensPeriodo
+    .filter((i) => vendasDoadas.some((v) => v.id === i.vendaId))
+    .reduce((sum, i) => sum + i.quantidade, 0);
+
+  const ciclos = { Manhã: { quantidade: 0, total: 0 }, Tarde: { quantidade: 0, total: 0 } };
+  vendasPeriodo.forEach((v) => {
+    const c = ciclos[getCiclo(v.data)];
+    c.quantidade += 1;
+    c.total += v.valorTotal;
+  });
+
+  return {
+    periodo: { start, end },
+    ciclos,
+    quantidadeVendas: vendasPeriodo.length,
+    salgados: somaPorTipo("salgado"),
+    refrigerantes: somaPorTipo("refrigerante"),
+    trufas: somaPorTipo("trufa"),
+    faturamentoTotal,
+    valorRecebidoVista,
+    valorRecebidoFiado,
+    creditoRecebido,
+    creditoUsado,
+    valorFiado,
+    valorAindaAReceber,
+    descontoTotal,
+    doacaoTotal,
+    doacaoQuantidade,
+    formasPagamento,
+    vendas: vendasPeriodo,
+  };
+}
+
+/* ==========================================================================
+   8. ESTADO DA UI
+   ========================================================================== */
+
+const ui = {
+  viewAtual: "inicio",
+  turno: "todos", // filtro global: "todos" | "Manhã" | "Tarde"
+  novaVenda: {
+    step: 1,
+    clienteId: null,
+    itens: {}, // produtoId -> quantidade
+    formaPagamento: null,
+    metodoVista: null,
+    buscaCliente: "",
+    dataPrevisaoPagamento: null,
+    desconto: 0,
+    descricao: "", // descrição obrigatória nas vendas de Cliente Avulso
+    usarCredito: false,
+    valorRecebido: null,
+  },
+  clientes: { busca: "" },
+  venda: { clienteFiltro: "" },
+  fiado: {
+    ordenacao: "previsao-proxima",
+    buscaCliente: "",
+    statusFiltro: "FIADO_PENDENTE",
+    periodoFiltro: "todos",
+    customStart: null,
+    customEnd: null,
+  },
+  relatorio: { filtro: "hoje", customStart: null, customEnd: null, clienteFiltro: "", statusFiltro: "" },
+  clientePerfilId: null,
+};
+
+function resetNovaVendaState() {
+  ui.novaVenda = {
+    step: 1,
+    clienteId: null,
+    itens: {},
+    formaPagamento: null,
+    metodoVista: null,
+    buscaCliente: "",
+    dataPrevisaoPagamento: null,
+    desconto: 0,
+    descricao: "", // descrição obrigatória nas vendas de Cliente Avulso
+    usarCredito: false,
+    valorRecebido: null,
+  };
+}
+
+/* ==========================================================================
+   9. TOAST E MODAIS GENÉRICOS
+   ========================================================================== */
+
+let toastTimeout = null;
+function showToast(mensagem) {
+  const toast = document.getElementById("toast");
+  toast.textContent = mensagem;
+  toast.classList.remove("hidden");
+  toast.classList.add("toast--visible");
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => {
+    toast.classList.remove("toast--visible");
+    setTimeout(() => toast.classList.add("hidden"), 250);
+  }, 2200);
+}
+
+function openConfirm({ title, message, confirmText = "Confirmar", cancelText = "Cancelar", danger = false, onConfirm, somenteConfirmar = false }) {
+  const modal = document.getElementById("modal-confirm");
+  modal.querySelector(".modal__title").textContent = title;
+  const messageEl = modal.querySelector(".modal__message");
+  // Mensagens com quebra de linha (ex.: resumo de pagamento) viram <br> —
+  // o resto do app só usa texto simples, então isso não afeta nada mais.
+  if (message.includes("\n")) messageEl.innerHTML = message.replace(/\n/g, "<br>");
+  else messageEl.textContent = message;
+  const btnConfirm = modal.querySelector(".modal__confirm-btn");
+  const btnCancel = modal.querySelector(".modal__cancel-btn");
+  btnConfirm.textContent = confirmText;
+  btnCancel.textContent = cancelText;
+  btnCancel.classList.toggle("hidden", somenteConfirmar);
+  btnConfirm.classList.toggle("btn--danger", danger);
+
+  const cleanup = () => {
+    modal.classList.add("hidden");
+    btnConfirm.onclick = null;
+    btnCancel.onclick = null;
+  };
+  btnConfirm.onclick = () => {
+    cleanup();
+    onConfirm && onConfirm();
+  };
+  btnCancel.onclick = cleanup;
+  modal.classList.remove("hidden");
+}
+
+// Modal genérico com campos dinâmicos (usado para pagamento, estoque, cliente rápido etc.)
+function openPrompt({ title, fields, confirmText = "Salvar", onSubmit }) {
+  const modal = document.getElementById("modal-prompt");
+  modal.querySelector(".modal__title").textContent = title;
+  const body = modal.querySelector(".modal__body");
+  body.innerHTML = fields
+    .map(
+      (f) => `
+      <div class="form-field">
+        <label for="prompt-${f.id}">${f.label}</label>
+        ${
+          f.type === "select"
+            ? `<select id="prompt-${f.id}">${f.options.map((o) => `<option value="${o.value}">${o.label}</option>`).join("")}</select>`
+            : `<input id="prompt-${f.id}" type="${f.type || "text"}" inputmode="${f.inputmode || ""}" placeholder="${f.placeholder || ""}" value="${f.value != null ? f.value : ""}" ${f.step ? `step="${f.step}"` : ""} ${f.max != null ? `max="${f.max}"` : ""} />`
+        }
+      </div>`
+    )
+    .join("");
+
+  const btnConfirm = modal.querySelector(".modal__confirm-btn");
+  const btnCancel = modal.querySelector(".modal__cancel-btn");
+  btnConfirm.textContent = confirmText;
+  btnConfirm.classList.remove("btn--danger");
+
+  const cleanup = () => {
+    modal.classList.add("hidden");
+    btnConfirm.onclick = null;
+    btnCancel.onclick = null;
+  };
+
+  btnConfirm.onclick = () => {
+    const values = {};
+    fields.forEach((f) => {
+      const el = document.getElementById(`prompt-${f.id}`);
+      values[f.id] = f.type === "number" ? parseFloat(el.value.replace(",", ".")) || 0 : el.value;
+    });
+    cleanup();
+    onSubmit(values);
+  };
+  btnCancel.onclick = cleanup;
+  modal.classList.remove("hidden");
+
+  const firstInput = body.querySelector("input, select");
+  if (firstInput) setTimeout(() => firstInput.focus(), 50);
+}
+
+/* ==========================================================================
+   10. NAVEGAÇÃO PRINCIPAL
+   ========================================================================== */
+
+function switchView(viewName) {
+  ui.viewAtual = viewName;
+  document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
+  document.getElementById(`view-${viewName}`).classList.remove("hidden");
+  document.querySelectorAll(".nav-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.view === viewName));
+  renderView(viewName);
+}
+
+function renderView(viewName) {
+  if (viewName === "inicio") renderDashboard();
+  else if (viewName === "venda") renderVendaView();
+  else if (viewName === "clientes") renderClientes();
+  else if (viewName === "fiado") renderFiado();
+  else if (viewName === "estoque") renderEstoque();
+  else if (viewName === "acerto") renderAcerto();
+}
+
+function openOverlay(id) {
+  document.getElementById(id).classList.remove("hidden");
+}
+function closeOverlay(id) {
+  document.getElementById(id).classList.add("hidden");
+}
+
+/* ==========================================================================
+   11. RENDERIZAÇÃO — DASHBOARD (INÍCIO)
+   ========================================================================== */
+
+function renderDashboard() {
+  const config = db.configuracoes;
+  const vendasHoje = getVendasDoDia();
+  const totalVendidoHoje = vendasHoje.reduce((sum, v) => sum + v.valorTotal, 0);
+  const salgadosVendidosHoje = getQuantidadeSalgadosNaData();
+  const meta = config.metaDiaria;
+  const percentualMeta = Math.min(999, Math.round((salgadosVendidosHoje / meta) * 100));
+  const fiadoAberto = getFiadoEmAbertoTotal();
+  const vistaHoje = getVistaHoje();
+  const recebidoFiadoHoje = getRecebidoFiadoHoje();
+  const creditoRecebidoHoje = getCreditoRecebidoHoje();
+  const creditoEmCaixa = getCreditoTotalEmCaixa();
+  const alertas = getAlertasEstoque();
+  const fiadoAtrasado = getVendasFiadoAtrasadas();
+
+  // Consolidado por cliente: uma linha por nome, somando o que ele deve em atraso.
+  const porClienteAtrasado = new Map();
+  fiadoAtrasado.forEach((v) => {
+    const acc = porClienteAtrasado.get(v.clienteId) || { total: 0, quantidade: 0, maisAntiga: null };
+    acc.total += v.valorRestante;
+    acc.quantidade += 1;
+    if (v.dataPrevisaoPagamento && (!acc.maisAntiga || v.dataPrevisaoPagamento < acc.maisAntiga)) acc.maisAntiga = v.dataPrevisaoPagamento;
+    porClienteAtrasado.set(v.clienteId, acc);
+  });
+  const atrasadosPorCliente = [...porClienteAtrasado.entries()]
+    .map(([clienteId, acc]) => ({ ...acc, total: arred2(acc.total), nome: getCliente(clienteId)?.nome || "Cliente" }))
+    .sort((a, b) => b.total - a.total);
+
+  const el = document.getElementById("view-inicio");
+
+  let metaMensagem = `🟢 ${percentualMeta}% da meta`;
+  if (salgadosVendidosHoje > meta) metaMensagem = `🔥 META SUPERADA! (${percentualMeta}%)`;
+  else if (salgadosVendidosHoje === meta) metaMensagem = `🎉 META ATINGIDA!`;
+
+  el.innerHTML = `
+    <h2 class="business-title">🤠 ${config.nomeNegocio}</h2>
+    <p class="business-subtitle">Resumo de hoje, ${new Date().toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long" })}</p>
+
+    <div class="dash-grid">
+      <div class="dash-card">
+        <span class="dash-card__label">Vendas de hoje</span>
+        <span class="dash-card__value">💰 ${formatCurrency(totalVendidoHoje)}</span>
+      </div>
+      <div class="dash-card">
+        <span class="dash-card__label">Salgados vendidos</span>
+        <span class="dash-card__value">🌭 ${salgadosVendidosHoje} / ${meta}</span>
+      </div>
+    </div>
+
+    <div class="panel meta-panel">
+      <div class="meta-panel__header">
+        <span>Meta diária</span>
+        <strong>${metaMensagem}</strong>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-bar__fill" style="width:${Math.min(100, percentualMeta)}%"></div>
+      </div>
+      <div class="meta-panel__footer">
+        <span>${salgadosVendidosHoje} vendidos</span>
+        <span>${Math.max(0, meta - salgadosVendidosHoje)} restantes</span>
+      </div>
+    </div>
+
+    <div class="stat-row">
+      <div class="stat-box"><span>📒 Fiado em aberto</span><strong>${formatCurrency(fiadoAberto)}</strong></div>
+      <div class="stat-box"><span>💵 À vista hoje</span><strong>${formatCurrency(vistaHoje)}</strong></div>
+      <div class="stat-box"><span>💰 Recebido (fiado)</span><strong>${formatCurrency(recebidoFiadoHoje)}</strong></div>
+    </div>
+    ${
+      creditoEmCaixa > 0 || creditoRecebidoHoje > 0
+        ? `<div class="dash-grid">
+            <div class="dash-card dash-card--success">
+              <span class="dash-card__label">Crédito recebido hoje</span>
+              <span class="dash-card__value">💚 ${formatCurrency(creditoRecebidoHoje)}</span>
+            </div>
+            <div class="dash-card dash-card--success">
+              <span class="dash-card__label">Crédito em caixa (clientes)</span>
+              <span class="dash-card__value">💚 ${formatCurrency(creditoEmCaixa)}</span>
+            </div>
+          </div>`
+        : ""
+    }
+
+    ${
+      atrasadosPorCliente.length > 0
+        ? `<div class="panel alert-panel alert-panel--danger" id="dash-alerta-fiado">
+            <strong>🚨 FIADO ATRASADO — ${atrasadosPorCliente.length} cliente${atrasadosPorCliente.length > 1 ? "s" : ""} · ${formatCurrency(atrasadosPorCliente.reduce((s, a) => s + a.total, 0))}</strong>
+            <ul class="alert-list">
+              ${atrasadosPorCliente
+                .map((a) => {
+                  const prazo = a.maisAntiga ? `desde ${formatDateOnly(a.maisAntiga)}` : "sem data prevista";
+                  const vendas = a.quantidade > 1 ? `${a.quantidade} vendas, ` : "";
+                  return `<li>${a.nome} — ${formatCurrency(a.total)} (${vendas}${prazo})</li>`;
+                })
+                .join("")}
+            </ul>
+          </div>`
+        : ""
+    }
+
+    ${
+      alertas.length > 0
+        ? `<div class="panel alert-panel">
+            <strong>⚠️ ESTOQUE BAIXO</strong>
+            <ul class="alert-list">
+              ${alertas.map((a) => `<li>${a.produto.icon} ${a.produto.nome}: ${a.quantidadeAtual} (mín. ${a.estoqueMinimo})</li>`).join("")}
+            </ul>
+          </div>`
+        : ""
+    }
+
+    <button class="btn btn--primary btn--block btn--xl" id="dash-nova-venda-btn">+ NOVA VENDA</button>
+  `;
+
+  document.getElementById("dash-nova-venda-btn").addEventListener("click", startNovaVenda);
+  document.getElementById("dash-alerta-fiado")?.addEventListener("click", () => switchView("fiado"));
+}
+
+/* ==========================================================================
+   12. RENDERIZAÇÃO — VENDA (lista do dia + acesso ao relatório)
+   ========================================================================== */
+
+function renderVendaView() {
+  const el = document.getElementById("view-venda");
+  const vendasHoje = getVendasDoDia();
+
+  // Acumulado por cliente (somando tudo que ele comprou hoje, sem listar
+  // cada venda) e total por ciclo (manhã/tarde, pelo horário do lançamento).
+  // Por cliente também junta o que foi vendido (produto x quantidade) e
+  // quanto já está pago / ainda não pago (legenda).
+  // A lista vem ordenada pela venda mais recente (quem comprou por último no topo).
+  const porCliente = new Map();
+  let totalDia = 0;
+  const ciclos = { Manhã: 0, Tarde: 0 };
+  // Vendas de Cliente Avulso ficam separadas, uma por linha (com a descrição),
+  // em vez de somadas num "cliente" só — mas entram no total do dia e nos ciclos.
+  const avulsas = [];
+  vendasHoje.forEach((v) => {
+    if (v.clienteId === CLIENTE_AVULSO_ID) {
+      avulsas.push(v);
+      totalDia += v.valorTotal;
+      ciclos[getCiclo(v.data)] += v.valorTotal;
+      return;
+    }
+    const acc = porCliente.get(v.clienteId) || {
+      total: 0, avista: 0, fiadoPago: 0, parcial: 0, pendente: 0, doado: 0, ultima: 0, itens: new Map(),
+    };
+    const restante = v.formaPagamento === "fiado" ? Math.min(v.valorRestante, v.valorTotal) : 0;
+    acc.total += v.valorTotal;
+    acc.ultima = Math.max(acc.ultima, new Date(v.data).getTime() || 0);
+    if (v.formaPagamento === "doacao") acc.doado += getItensDeVenda(v.id).reduce((s, i) => s + i.valorTotal, 0);
+    else if (v.formaPagamento !== "fiado") acc.avista += v.valorTotal;
+    else if (v.status === "pago") acc.fiadoPago += v.valorTotal;
+    else {
+      acc.pendente += restante;
+      acc.parcial += v.valorTotal - restante;
+    }
+    db.itensVenda
+      .filter((i) => i.vendaId === v.id)
+      .forEach((i) => acc.itens.set(i.produtoId, (acc.itens.get(i.produtoId) || 0) + i.quantidade));
+    porCliente.set(v.clienteId, acc);
+    totalDia += v.valorTotal;
+    ciclos[getCiclo(v.data)] += v.valorTotal;
+  });
+  const linhas = [...porCliente.entries()]
+    .map(([clienteId, acc]) => ({
+      clienteId,
+      total: acc.total,
+      ultima: acc.ultima,
+      legenda: [
+        [acc.avista, "badge--success", "🟢 À vista"],
+        [acc.fiadoPago, "badge--success", "🟢 Fiado - Pago"],
+        [acc.parcial, "badge--warning", "🟡 Fiado - Pago parcial"],
+        [acc.pendente, "badge--danger", "🔴 Fiado - Pendente"],
+        [acc.doado, "badge--doado", "🎁 Doado"],
+      ].filter(([valor]) => arred2(valor) > 0),
+      itens: [...acc.itens.entries()].map(([produtoId, qtd]) => `${qtd}x ${getProduto(produtoId)?.nome || "Produto"}`).join(", "),
+      nome: getCliente(clienteId)?.nome || "Cliente",
+    }))
+    .sort((a, b) => b.ultima - a.ultima);
+
+  el.innerHTML = `
+    <h2 class="view-title">🛒 Venda</h2>
+    <button class="btn btn--primary btn--block btn--xl" id="venda-nova-btn">+ NOVA VENDA</button>
+
+    <button class="btn btn--secondary btn--block" id="venda-relatorio-btn">📊 Ver relatório completo</button>
+    <button class="btn btn--secondary btn--block" id="venda-relpag-btn">💰 Relatório de quem pagou</button>
+
+    <div class="stat-row">
+      <div class="stat-box"><span>Total do dia</span><strong>${formatCurrency(totalDia)}</strong></div>
+      <div class="stat-box"><span>🌅 Manhã</span><strong>${formatCurrency(ciclos.Manhã)}</strong></div>
+      <div class="stat-box"><span>🌇 Tarde</span><strong>${formatCurrency(ciclos.Tarde)}</strong></div>
+    </div>
+
+    <h3 class="section-subtitle">Vendas de hoje por cliente (${linhas.length})</h3>
+    <ul class="list">
+      ${
+        linhas.length === 0
+          ? `<li class="empty-state">Nenhuma venda registrada hoje ainda.</li>`
+          : linhas
+              .map(
+                (l) => `
+                <li class="list-item" data-cliente-id="${l.clienteId}">
+                  <div class="list-item__main">
+                    <strong>${l.nome}</strong>
+                    <span class="list-item__itens">${l.itens}</span>
+                    <span class="list-item__itens">Última venda às ${new Date(l.ultima).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</span>
+                    <div class="venda-legenda">
+                      ${l.legenda.map(([valor, cls, texto]) => `<span class="badge ${cls}">${texto} ${formatCurrency(valor)}</span>`).join("")}
+                    </div>
+                  </div>
+                  <div class="list-item__side"><span class="list-item__value">${formatCurrency(l.total)}</span></div>
+                </li>`
+              )
+              .join("")
+      }
+    </ul>
+
+    ${
+      avulsas.length === 0
+        ? ""
+        : `<h3 class="section-subtitle">🧾 Vendas avulsas — balcão (${avulsas.length})</h3>
+    <ul class="list">
+      ${[...avulsas]
+        .sort((a, b) => new Date(b.data) - new Date(a.data))
+        .map((v) => {
+          const status = getStatusPagamento(v);
+          const itens = getItensDeVenda(v.id).map((i) => `${i.quantidade}x ${getProduto(i.produtoId)?.nome || "Produto"}`).join(", ");
+          const doado = status.code === "DOADO";
+          const valor = doado ? getItensDeVenda(v.id).reduce((s, i) => s + i.valorTotal, 0) : v.valorTotal;
+          return `
+          <li class="list-item list-item--avulsa">
+            <div class="list-item__main">
+              <strong>${v.descricao || "Sem descrição"}</strong>
+              <span class="list-item__itens">${itens}</span>
+              <span class="list-item__itens">${new Date(v.data).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</span>
+              <div class="venda-legenda"><span class="badge ${doado ? "badge--doado" : "badge--success"}">${status.emoji} ${status.label}</span></div>
+            </div>
+            <div class="list-item__side"><span class="list-item__value">${formatCurrency(valor)}</span></div>
+          </li>`;
+        })
+        .join("")}
+    </ul>`
+    }
+  `;
+
+  document.getElementById("venda-nova-btn").addEventListener("click", startNovaVenda);
+  document.getElementById("venda-relpag-btn").addEventListener("click", abrirRelatorioPagamentos);
+  document.getElementById("venda-relatorio-btn").addEventListener("click", () => {
+    renderRelatorio();
+    openOverlay("overlay-relatorio");
+  });
+  el.querySelectorAll("[data-cliente-id]").forEach((item) => {
+    item.addEventListener("click", () => abrirPerfilCliente(item.dataset.clienteId));
+  });
+}
+
+function confirmarExcluirVenda(vendaId) {
+  const venda = db.vendas.find((v) => v.id === vendaId);
+  if (!venda) return;
+  const cliente = getCliente(venda.clienteId);
+  openConfirm({
+    title: "🗑️ Excluir venda",
+    message: `Excluir a venda de ${formatCurrency(venda.valorTotal)} de ${cliente ? cliente.nome : "Cliente"}? Os produtos vendidos voltam pro estoque. Essa ação não pode ser desfeita.`,
+    confirmText: "Excluir",
+    danger: true,
+    onConfirm: () => {
+      excluirVenda(vendaId);
+      showToast("Venda excluída.");
+      renderView(ui.viewAtual);
+      if (!document.getElementById("overlay-cliente-perfil").classList.contains("hidden")) renderPerfilCliente();
+    },
+  });
+}
+
+function abrirEditarValorVenda(vendaId) {
+  const venda = db.vendas.find((v) => v.id === vendaId);
+  if (!venda) return;
+  openPrompt({
+    title: "✏️ Editar valor total da venda",
+    fields: [
+      { id: "valor", label: "Novo valor total", type: "number", inputmode: "decimal", step: "0.01", value: venda.valorTotal },
+    ],
+    confirmText: "Salvar",
+    onSubmit: (values) => {
+      if (values.valor <= 0) {
+        showToast("Informe um valor válido.");
+        return;
+      }
+      editarValorTotalVenda(vendaId, values.valor);
+      showToast("Valor da venda atualizado!");
+      renderView(ui.viewAtual);
+      if (!document.getElementById("overlay-cliente-perfil").classList.contains("hidden")) renderPerfilCliente();
+    },
+  });
+}
+
+/* ==========================================================================
+   13. RENDERIZAÇÃO — CLIENTES
+   ========================================================================== */
+
+function filtrarClientes(termo) {
+  const t = termo.trim().toLowerCase();
+  const tDigits = onlyDigits(termo);
+  if (!t) return db.clientes;
+  return db.clientes.filter((c) => c.nome.toLowerCase().includes(t) || (tDigits && c.telefone.includes(tDigits)));
+}
+
+function renderClientes() {
+  const el = document.getElementById("view-clientes");
+
+  el.innerHTML = `
+    <h2 class="view-title">👥 Clientes</h2>
+    <input type="search" id="clientes-busca" class="search-input" placeholder="Buscar por nome ou telefone" value="${ui.clientes.busca}" />
+    <button class="btn btn--secondary btn--block" id="clientes-novo-btn">+ Novo cliente</button>
+    <ul class="list" id="clientes-lista"></ul>
+  `;
+
+  renderListaClientes();
+
+  // A busca só re-renderiza a lista (não o campo em si) — recriar o input a
+  // cada tecla digitada tira o foco dele e só deixa digitar uma letra por vez.
+  document.getElementById("clientes-busca").addEventListener("input", (e) => {
+    ui.clientes.busca = e.target.value;
+    renderListaClientes();
+  });
+  document.getElementById("clientes-novo-btn").addEventListener("click", () => abrirFormNovoCliente());
+}
+
+function renderListaClientes() {
+  const vendasTurno = vendasDoTurno();
+  const lista = filtrarClientes(ui.clientes.busca).slice().sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+  const ul = document.getElementById("clientes-lista");
+
+  ul.innerHTML =
+    lista.length === 0
+      ? `<li class="empty-state">Nenhum cliente encontrado.</li>`
+      : lista
+          .map((c) => {
+            const saldo = calcularSaldoCliente(c.id, vendasTurno);
+            const status = calcularStatusCliente(c.id, vendasTurno);
+            return `
+            <li class="list-item" data-cliente-id="${c.id}">
+              <div class="list-item__main">
+                <strong>${c.nome}</strong>
+                <span class="list-item__meta">📱 ${formatPhone(c.telefone)}</span>
+                ${htmlStatusCobranca(c)}
+              </div>
+              <div class="list-item__side">
+                <span class="badge">${status.emoji} ${saldo > 0 ? `Deve ${formatCurrency(saldo)}` : "Em dia"}</span>
+                ${getCreditoCliente(c.id) > 0 ? `<span class="badge badge--credito">💚 Crédito ${formatCurrency(getCreditoCliente(c.id))}</span>` : ""}
+              </div>
+            </li>`;
+          })
+          .join("");
+
+  ul.querySelectorAll("[data-cliente-id]").forEach((item) => {
+    item.addEventListener("click", () => abrirPerfilCliente(item.dataset.clienteId));
+  });
+}
+
+function abrirFormNovoCliente(onCreated) {
+  openPrompt({
+    title: "+ Novo cliente",
+    fields: [
+      { id: "nome", label: "Nome", type: "text", placeholder: "Ex: João" },
+      { id: "telefone", label: "Telefone/WhatsApp", type: "tel", inputmode: "numeric", placeholder: "Ex: 11987654321" },
+      { id: "observacao", label: "Observação (opcional)", type: "text", placeholder: "Ex: prefere sem cebola" },
+    ],
+    confirmText: "Cadastrar",
+    onSubmit: (values) => {
+      if (!values.nome.trim()) {
+        showToast("Informe o nome do cliente.");
+        return;
+      }
+      const cliente = criarCliente(values);
+      showToast(`Cliente ${cliente.nome} cadastrado!`);
+      if (onCreated) onCreated(cliente);
+      else renderClientes();
+    },
+  });
+}
+
+/* ==========================================================================
+   14. RENDERIZAÇÃO — PERFIL DO CLIENTE
+   ========================================================================== */
+
+function abrirPerfilCliente(clienteId) {
+  ui.clientePerfilId = clienteId;
+  renderPerfilCliente();
+  openOverlay("overlay-cliente-perfil");
+}
+
+function renderPerfilCliente() {
+  const cliente = getCliente(ui.clientePerfilId);
+  if (!cliente) return;
+  const el = document.getElementById("overlay-cliente-perfil");
+  const saldo = calcularSaldoCliente(cliente.id);
+  const credito = getCreditoCliente(cliente.id);
+  const status = calcularStatusCliente(cliente.id);
+  const compras = db.vendas.filter((v) => v.clienteId === cliente.id).sort((a, b) => new Date(b.data) - new Date(a.data));
+  const pagamentos = db.pagamentos.filter((p) => p.clienteId === cliente.id).sort((a, b) => new Date(b.data) - new Date(a.data));
+
+  el.innerHTML = `
+    <div class="overlay__header">
+      <button class="icon-btn" data-action="fechar-perfil">←</button>
+      <h2>Perfil do cliente</h2>
+      ${
+        cliente.fixo
+          ? ""
+          : `<div class="overlay__header-actions">
+               <button class="icon-btn" data-action="editar-cliente">✏️</button>
+               <button class="icon-btn" data-action="excluir-cliente">🗑️</button>
+             </div>`
+      }
+    </div>
+    <div class="overlay__body">
+      <div class="panel profile-card">
+        <h3>${cliente.nome}</h3>
+        <p class="profile-card__phone">📱 ${formatPhone(cliente.telefone)}</p>
+        <p class="profile-card__saldo">${status.emoji} ${saldo > 0 ? `Deve ${formatCurrency(saldo)}` : "Sem dívidas"}</p>
+        ${credito > 0 ? `<p class="profile-card__credito">💚 Saldo positivo (crédito): ${formatCurrency(credito)}</p>` : ""}
+        ${cliente.observacao ? `<p class="profile-card__obs">📝 ${cliente.observacao}</p>` : ""}
+      </div>
+
+      <div class="stat-row">
+        <div class="stat-box"><span>Total comprado</span><strong>${formatCurrency(totalCompradoCliente(cliente.id))}</strong></div>
+        <div class="stat-box"><span>Total pago</span><strong>${formatCurrency(totalPagoCliente(cliente.id))}</strong></div>
+        <div class="stat-box"><span>Em aberto</span><strong>${formatCurrency(saldo)}</strong></div>
+      </div>
+
+      <div class="profile-actions">
+        <button class="btn btn--secondary btn--block" data-action="nova-venda-cliente">🛒 Nova venda pra este cliente</button>
+        <button class="btn btn--primary btn--block" data-action="registrar-pagamento" ${saldo <= 0 ? "disabled" : ""}>💰 Registrar pagamento</button>
+        ${cliente.fixo ? "" : `<button class="btn btn--secondary btn--block" data-action="adicionar-credito">💚 Adicionar crédito (adiantamento)</button>`}
+        <button class="btn btn--secondary btn--block" data-action="remover-credito">✂️ Corrigir / remover crédito</button>
+        ${credito > 0 && saldo > 0 ? `<button class="btn btn--secondary btn--block" data-action="usar-credito">💚 Usar crédito (${formatCurrency(Math.min(credito, saldo))}) na dívida</button>` : ""}
+        <button class="btn btn--whatsapp btn--block" data-action="cobrar-whatsapp" ${!cliente.telefone ? "disabled" : ""}>📱 Cobrar pelo WhatsApp</button>
+      </div>
+
+      <h4 class="section-subtitle">Histórico de compras</h4>
+      <ul class="list">
+        ${
+          compras.length === 0
+            ? `<li class="empty-state">Nenhuma compra registrada.</li>`
+            : compras
+                .map((v) => {
+                  const badge = getStatusPagamento(v);
+                  const itens = getItensDeVenda(v.id).map((i) => `${getProduto(i.produtoId).nome} x${i.quantidade}`).join(", ");
+                  const extras = v.descricao ? [`📝 ${v.descricao}`] : [];
+                  if (v.formaPagamento === "fiado" && v.dataPrevisaoPagamento) extras.push(`Previsto: ${formatDateOnly(v.dataPrevisaoPagamento)}`);
+                  if (v.dataPagamento) extras.push(`Pago em: ${formatDateShort(v.dataPagamento)}`);
+                  const atrasada = isVendaAtrasada(v);
+                  const pendente = v.formaPagamento === "fiado" && v.status !== "pago";
+                  return `<li class="list-item" data-venda-id="${v.id}">
+                    <div class="list-item__main">
+                      <strong>${formatDateTime(v.data)} · ${getCiclo(v.data)}</strong>
+                      <span class="list-item__meta">${itens}${extras.length ? " · " + extras.join(" · ") : ""}</span>
+                    </div>
+                    <div class="list-item__side">
+                      <div class="list-item__value-row">
+                        <span class="list-item__value">${formatCurrency(v.valorTotal)}</span>
+                        <button class="list-item__edit-btn" data-action="editar-valor-perfil" aria-label="Editar valor total">✏️</button>
+                        <button class="list-item__edit-btn" data-action="excluir-venda-perfil" aria-label="Excluir venda">🗑️</button>
+                      </div>
+                      <span class="badge">${badge.emoji} ${badge.label}</span>
+                      ${atrasada ? `<span class="badge badge--danger">⏰ Atrasado</span>` : ""}
+                      ${pendente ? `<button class="list-item__edit-btn" data-action="editar-previsao-perfil" aria-label="Nova data prevista">📅</button>` : ""}
+                    </div>
+                  </li>`;
+                })
+                .join("")
+        }
+      </ul>
+
+      <h4 class="section-subtitle">Histórico de pagamentos</h4>
+      <ul class="list">
+        ${
+          pagamentos.length === 0
+            ? `<li class="empty-state">Nenhum pagamento registrado.</li>`
+            : pagamentos
+                .map(
+                  (p) => `<li class="list-item">
+                    <div class="list-item__main"><strong>${formatDateTime(p.data)}</strong><span class="list-item__meta">${p.vendaId === CREDITO_ID ? `Sobra do pagamento (virou crédito) · ${p.formaPagamento}` : p.vendaId === CREDITO_USADO_ID ? "Crédito usado na dívida" : p.formaPagamento}</span></div>
+                    <div class="list-item__side"><span class="list-item__value">${formatCurrency(p.valor)}</span></div>
+                  </li>`
+                )
+                .join("")
+        }
+      </ul>
+    </div>
+  `;
+
+  el.querySelector('[data-action="fechar-perfil"]').addEventListener("click", () => {
+    closeOverlay("overlay-cliente-perfil");
+    renderView(ui.viewAtual);
+  });
+  const editBtn = el.querySelector('[data-action="editar-cliente"]');
+  if (editBtn) editBtn.addEventListener("click", () => abrirFormEditarCliente(cliente));
+  const delBtn = el.querySelector('[data-action="excluir-cliente"]');
+  if (delBtn) delBtn.addEventListener("click", () => confirmarExcluirCliente(cliente));
+  el.querySelector('[data-action="nova-venda-cliente"]').addEventListener("click", () => {
+    closeOverlay("overlay-cliente-perfil");
+    startNovaVendaParaCliente(cliente.id);
+  });
+  el.querySelector('[data-action="registrar-pagamento"]').addEventListener("click", () => abrirFormPagamento(cliente));
+  el.querySelector('[data-action="adicionar-credito"]')?.addEventListener("click", () => abrirFormCredito(cliente));
+  el.querySelector('[data-action="remover-credito"]')?.addEventListener("click", () => abrirFormRemoverCredito(cliente));
+  el.querySelector('[data-action="usar-credito"]')?.addEventListener("click", () => {
+    const usado = usarCreditoCliente(cliente.id);
+    showToast(`💚 ${formatCurrency(usado)} de crédito abatido da dívida.`);
+    renderPerfilCliente();
+  });
+  el.querySelector('[data-action="cobrar-whatsapp"]').addEventListener("click", () => cobrarPeloWhatsApp(cliente));
+  el.querySelectorAll("[data-venda-id]").forEach((item) => {
+    item.querySelector('[data-action="editar-valor-perfil"]')?.addEventListener("click", () => abrirEditarValorVenda(item.dataset.vendaId));
+    item.querySelector('[data-action="excluir-venda-perfil"]')?.addEventListener("click", () => confirmarExcluirVenda(item.dataset.vendaId));
+    item.querySelector('[data-action="editar-previsao-perfil"]')?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const venda = db.vendas.find((v) => v.id === item.dataset.vendaId);
+      if (venda) abrirFormPrevisao(venda, renderPerfilCliente);
+    });
+  });
+}
+
+function abrirFormEditarCliente(cliente) {
+  openPrompt({
+    title: "Editar cliente",
+    fields: [
+      { id: "nome", label: "Nome", type: "text", value: cliente.nome },
+      { id: "telefone", label: "Telefone/WhatsApp", type: "tel", inputmode: "numeric", value: cliente.telefone },
+      { id: "observacao", label: "Observação", type: "text", value: cliente.observacao },
+    ],
+    confirmText: "Salvar",
+    onSubmit: (values) => {
+      editarCliente(cliente.id, values);
+      showToast("Cliente atualizado!");
+      renderPerfilCliente();
+    },
+  });
+}
+
+function confirmarExcluirCliente(cliente) {
+  const saldo = calcularSaldoCliente(cliente.id);
+  const totalVendas = db.vendas.filter((v) => v.clienteId === cliente.id).length;
+  const totalPagamentos = db.pagamentos.filter((p) => p.clienteId === cliente.id).length;
+  const detalhesHistorico =
+    totalVendas > 0 || totalPagamentos > 0
+      ? ` Isso apaga também ${totalVendas} venda(s) e ${totalPagamentos} pagamento(s) do histórico dele.`
+      : "";
+  openConfirm({
+    title: "🗑️ Excluir cliente",
+    message:
+      (saldo > 0
+        ? `${cliente.nome} ainda tem ${formatCurrency(saldo)} em aberto.`
+        : `Tem certeza que deseja excluir ${cliente.nome}?`) +
+      detalhesHistorico +
+      " Essa ação não pode ser desfeita.",
+    confirmText: "Excluir",
+    danger: true,
+    onConfirm: () => {
+      excluirCliente(cliente.id);
+      showToast("Cliente e histórico excluídos.");
+      closeOverlay("overlay-cliente-perfil");
+      renderView(ui.viewAtual);
+    },
+  });
+}
+
+// Caixa positivo: o cliente deixa dinheiro adiantado, sem precisar de venda.
+function abrirFormCredito(cliente) {
+  openPrompt({
+    title: "💚 Adicionar crédito",
+    fields: [
+      { id: "valor", label: `Valor que ${cliente.nome} está deixando de crédito`, type: "number", inputmode: "decimal", step: "0.01", placeholder: "0,00" },
+      {
+        id: "forma",
+        label: "Forma de pagamento",
+        type: "select",
+        options: [
+          { value: "pix", label: "PIX" },
+          { value: "dinheiro", label: "Dinheiro" },
+          { value: "debito", label: "Débito" },
+          { value: "credito", label: "Crédito (cartão)" },
+        ],
+      },
+    ],
+    confirmText: "Adicionar",
+    onSubmit: (values) => {
+      if (values.valor <= 0) {
+        showToast("Informe um valor válido.");
+        return;
+      }
+      adicionarCreditoCliente(cliente.id, values.valor, values.forma);
+      showToast(`💚 ${formatCurrency(values.valor)} de crédito adicionado.`);
+      renderPerfilCliente();
+      if (ui.viewAtual === "inicio") renderView("inicio");
+    },
+  });
+}
+
+// Tira crédito lançado por engano (não é dinheiro devolvido nem usado em dívida).
+function abrirFormRemoverCredito(cliente) {
+  const credito = getCreditoCliente(cliente.id);
+  if (credito <= 0) {
+    showToast(`${cliente.nome} não tem crédito para remover.`);
+    return;
+  }
+  openPrompt({
+    title: "✂️ Corrigir crédito",
+    fields: [
+      {
+        id: "valor",
+        label: `Quanto remover do crédito de ${cliente.nome} (saldo atual: ${formatCurrency(credito)})`,
+        type: "number",
+        inputmode: "decimal",
+        step: "0.01",
+        value: credito,
+      },
+    ],
+    confirmText: "Remover",
+    onSubmit: (values) => {
+      if (!(values.valor > 0)) {
+        showToast("Informe um valor válido.");
+        return;
+      }
+      const removido = removerCreditoCliente(cliente.id, values.valor);
+      showToast(`✂️ ${formatCurrency(removido)} de crédito removido.`);
+      renderPerfilCliente();
+      renderView(ui.viewAtual);
+    },
+  });
+}
+
+function abrirFormPagamento(cliente) {
+  const saldo = calcularSaldoCliente(cliente.id);
+  openPrompt({
+    title: "💰 Registrar pagamento",
+    fields: [
+      { id: "valor", label: `Valor pago (deve: ${formatCurrency(saldo)} — se pagar mais, a sobra vira saldo positivo)`, type: "number", inputmode: "decimal", step: "0.01", placeholder: "0,00" },
+      {
+        id: "forma",
+        label: "Forma de pagamento",
+        type: "select",
+        options: [
+          { value: "pix", label: "PIX" },
+          { value: "dinheiro", label: "Dinheiro" },
+          { value: "debito", label: "Débito" },
+          { value: "credito", label: "Crédito (cartão)" },
+        ],
+      },
+    ],
+    confirmText: "Registrar",
+    onSubmit: (values) => {
+      if (values.valor <= 0) {
+        showToast("Informe um valor válido.");
+        return;
+      }
+      const saldoAntes = saldo;
+      const resultado = registrarPagamento(cliente.id, values.valor, values.forma);
+      const novoSaldo = calcularSaldoCliente(cliente.id);
+      renderPerfilCliente();
+      mostrarResumoPagamento({ cliente, saldoAntes, valorPago: resultado.valorRecebido, novoSaldo, sobra: resultado.sobra });
+    },
+  });
+}
+
+// Resumo grande e detalhado do pagamento (devia / pagou / restou) — a
+// "confirmação gritante" pedida, em vez de só um toast pequeno.
+function mostrarResumoPagamento({ cliente, saldoAntes, valorPago, novoSaldo, sobra = 0 }) {
+  const quitado = novoSaldo <= 0.004;
+  openConfirm({
+    title: quitado ? "🟢 Dívida quitada!" : "💰 Pagamento registrado",
+    message:
+      `<strong>${cliente.nome}</strong>\n` +
+      `Devia: ${formatCurrency(saldoAntes)}\n` +
+      `Pagou: <strong>${formatCurrency(valorPago)}</strong>\n` +
+      (sobra > 0
+        ? `Saldo positivo (crédito): <strong style="color:var(--success)">${formatCurrency(sobra)} 💚</strong>`
+        : quitado
+          ? `Saldo: <strong style="color:var(--success)">R$ 0,00 🎉</strong>`
+          : `Restou: <strong style="color:var(--danger)">${formatCurrency(novoSaldo)}</strong>`),
+    confirmText: "OK",
+    somenteConfirmar: true,
+  });
+}
+
+// Guarda quando a última cobrança foi enviada: na linha do cliente (vai pra
+// planilha, coluna "ultimaCobranca", e aparece em outros aparelhos) e também
+// só neste aparelho, pra não se perder se a planilha ainda não tiver a coluna.
+const COBRANCAS_KEY = "cowboySalgadosCobrancas_v1";
+
+function lerCobrancasLocais() {
+  try {
+    return JSON.parse(localStorage.getItem(COBRANCAS_KEY)) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function getUltimaCobranca(cliente) {
+  const local = lerCobrancasLocais()[cliente.id] || "";
+  const remota = cliente.ultimaCobranca || "";
+  return local > remota ? local : remota || null;
+}
+
+// Linhas "mensagem enviada" / "WhatsApp aberto" mostradas embaixo do cliente
+// nas abas Clientes e Fiado.
+function htmlStatusCobranca(cliente) {
+  if (!cliente) return "";
+  let enviada = getUltimaCobranca(cliente);
+  // Se a pessoa acertou (qualquer valor) depois da mensagem, o aviso some.
+  if (enviada) {
+    const quando = new Date(enviada).getTime();
+    const pagouDepois = db.pagamentos.some(
+      (p) => p.clienteId === cliente.id && p.vendaId !== CREDITO_USADO_ID && p.vendaId !== CREDITO_ID && new Date(p.data).getTime() > quando
+    );
+    if (pagouDepois) enviada = null;
+  }
+  const pendente = lerCobrancaPendente()?.clienteId === cliente.id;
+  return (
+    (enviada ? `<span class="list-item__enviado">✅ Mensagem enviada em ${formatDateTime(enviada)}</span>` : "") +
+    (pendente ? `<span class="list-item__meta">⏳ WhatsApp aberto — confirme o envio ao voltar pro app</span>` : "")
+  );
+}
+
+// Atualiza a lista da aba aberta (Clientes ou Fiado) depois de uma cobrança.
+function atualizarListaCobranca() {
+  if (ui.viewAtual === "clientes") renderListaClientes();
+  else if (ui.viewAtual === "fiado") renderFiadoLista();
+}
+
+function registrarCobrancaEnviada(clienteId) {
+  const cliente = getCliente(clienteId);
+  if (!cliente) return;
+  const agora = new Date().toISOString();
+  const locais = lerCobrancasLocais();
+  locais[clienteId] = agora;
+  localStorage.setItem(COBRANCAS_KEY, JSON.stringify(locais));
+  cliente.ultimaCobranca = agora;
+  saveDB();
+  syncInBackground("upsert", { sheet: "Clientes", row: cliente });
+}
+
+function cobrarPeloWhatsApp(cliente) {
+  const saldo = calcularSaldoCliente(cliente.id);
+  const mensagem =
+    saldo > 0
+      ? `Olá, ${cliente.nome}! 🤠\nPassando para lembrar que ficou um saldo de ${formatCurrency(saldo)} referente às suas compras no ${db.configuracoes.nomeNegocio}.\nObrigado!`
+      : `Olá, ${cliente.nome}! 🤠\nPassando para agradecer pela preferência no ${db.configuracoes.nomeNegocio}!`;
+
+  let digits = onlyDigits(cliente.telefone);
+  if (digits.length <= 11) digits = `55${digits}`;
+  const janela = window.open(`https://wa.me/${digits}?text=${encodeURIComponent(mensagem)}`, "_blank");
+  if (!janela) {
+    showToast("Não consegui abrir o WhatsApp. Libere pop-ups e tente de novo.");
+    return;
+  }
+  showToast(`📱 Abrindo o WhatsApp de ${cliente.nome}...`);
+  marcarCobrancaPendente(cliente.id);
+}
+
+// O WhatsApp só abre a conversa com o texto pronto — quem aperta "enviar" é a
+// pessoa, e o app não tem como saber se ela apertou. Então guardamos que a
+// conversa foi aberta (no aparelho, pra sobreviver se o celular recarregar o
+// app enquanto o WhatsApp está aberto) e, quando a pessoa volta pro app,
+// perguntamos se enviou. Só com o "sim" aparece o aviso de "enviada".
+const COBRANCA_PENDENTE_KEY = "cowboySalgadosCobrancaPendente_v1";
+
+function lerCobrancaPendente() {
+  try {
+    const p = JSON.parse(localStorage.getItem(COBRANCA_PENDENTE_KEY));
+    // Esquece pedidos antigos (mais de 6h) pra não perguntar fora de hora.
+    return p && Date.now() - p.abertoEm < 6 * 60 * 60 * 1000 ? p : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function marcarCobrancaPendente(clienteId) {
+  localStorage.setItem(COBRANCA_PENDENTE_KEY, JSON.stringify({ clienteId, abertoEm: Date.now() }));
+  atualizarListaCobranca();
+}
+
+function verificarCobrancaPendente() {
+  const pendente = lerCobrancaPendente();
+  if (!pendente) return;
+  // Ainda dentro do 1º segundo e meio = o próprio clique que abriu o WhatsApp.
+  if (document.visibilityState === "hidden" || Date.now() - pendente.abertoEm < 1500) return;
+  if (!document.getElementById("modal-confirm").classList.contains("hidden")) return;
+  const cliente = getCliente(pendente.clienteId);
+  localStorage.removeItem(COBRANCA_PENDENTE_KEY);
+  if (!cliente) return;
+
+  openConfirm({
+    title: "📱 Mensagem enviada?",
+    message: `Você enviou a mensagem para ${cliente.nome} no WhatsApp?`,
+    confirmText: "Sim, enviei",
+    cancelText: "Não enviei",
+    onConfirm: () => {
+      registrarCobrancaEnviada(cliente.id);
+      atualizarListaCobranca();
+      const hora = new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+      openConfirm({
+        title: "✅ Mensagem enviada!",
+        message: `A mensagem para ${cliente.nome} já foi enviada (${hora}).`,
+        confirmText: "OK",
+        somenteConfirmar: true,
+      });
+    },
+  });
+  atualizarListaCobranca();
+}
+
+/* ==========================================================================
+   15. RENDERIZAÇÃO — FIADO
+   ========================================================================== */
+
+function renderFiado() {
+  const el = document.getElementById("view-fiado");
+  const vendasTurno = vendasDoTurno();
+  const clientesComHistorico = db.clientes.filter((c) => vendasTurno.some((v) => v.clienteId === c.id && v.formaPagamento === "fiado"));
+
+  const totalAReceber = getFiadoEmAbertoTotal();
+  const clientesDevendo = clientesComHistorico.filter((c) => calcularSaldoCliente(c.id, vendasTurno) > 0);
+  const emAtraso = clientesDevendo.filter((c) => vendasTurno.some((v) => v.clienteId === c.id && isVendaAtrasada(v)));
+
+  const { buscaCliente, statusFiltro, periodoFiltro, customStart, customEnd, ordenacao } = ui.fiado;
+
+  el.innerHTML = `
+    <h2 class="view-title">📒 Fiado</h2>
+    <div class="stat-row">
+      <div class="stat-box"><span>Total a receber</span><strong>${formatCurrency(totalAReceber)}</strong></div>
+      <div class="stat-box"><span>Clientes devendo</span><strong>${clientesDevendo.length}</strong></div>
+      <div class="stat-box"><span>Em atraso</span><strong>${emAtraso.length}</strong></div>
+    </div>
+
+    <input type="search" id="fiado-busca-cliente" class="search-input" placeholder="Buscar cliente por nome ou telefone" value="${buscaCliente}" />
+
+    <div class="stat-row">
+      <div class="form-field">
+        <label for="fiado-filtro-status">Status</label>
+        <select id="fiado-filtro-status">
+          <option value="" ${statusFiltro === "" ? "selected" : ""}>Todos</option>
+          <option value="FIADO_PENDENTE" ${statusFiltro === "FIADO_PENDENTE" ? "selected" : ""}>Fiado - Pendente</option>
+          <option value="FIADO_PAGO" ${statusFiltro === "FIADO_PAGO" ? "selected" : ""}>Fiado - Pago</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="fiado-filtro-periodo">Data prevista</label>
+        <select id="fiado-filtro-periodo">
+          <option value="todos" ${periodoFiltro === "todos" ? "selected" : ""}>Todas as datas</option>
+          <option value="vencidos" ${periodoFiltro === "vencidos" ? "selected" : ""}>Vencidos (atrasados)</option>
+          <option value="hoje" ${periodoFiltro === "hoje" ? "selected" : ""}>Vence hoje</option>
+          <option value="esta-semana" ${periodoFiltro === "esta-semana" ? "selected" : ""}>Vence esta semana</option>
+          <option value="mes" ${periodoFiltro === "mes" ? "selected" : ""}>Vence este mês</option>
+          <option value="personalizado" ${periodoFiltro === "personalizado" ? "selected" : ""}>Personalizado</option>
+        </select>
+      </div>
+    </div>
+    ${
+      periodoFiltro === "personalizado"
+        ? `<div class="stat-row">
+            <div class="form-field"><label>De</label><input type="date" id="fiado-periodo-start" value="${customStart || toDateKey(new Date())}"/></div>
+            <div class="form-field"><label>Até</label><input type="date" id="fiado-periodo-end" value="${customEnd || toDateKey(new Date())}"/></div>
+          </div>`
+        : ""
+    }
+
+    <div class="form-field">
+      <label for="fiado-ordenacao">Ordenar por</label>
+      <select id="fiado-ordenacao">
+        <option value="previsao-proxima" ${ordenacao === "previsao-proxima" ? "selected" : ""}>Data prevista (mais próxima primeiro)</option>
+        <option value="previsao-distante" ${ordenacao === "previsao-distante" ? "selected" : ""}>Data prevista (mais distante primeiro)</option>
+        <option value="venda-recente" ${ordenacao === "venda-recente" ? "selected" : ""}>Data da venda (mais recentes)</option>
+        <option value="venda-antiga" ${ordenacao === "venda-antiga" ? "selected" : ""}>Data da venda (mais antigas)</option>
+        <option value="valor" ${ordenacao === "valor" ? "selected" : ""}>Valor (maior primeiro)</option>
+        <option value="status" ${ordenacao === "status" ? "selected" : ""}>Status</option>
+        <option value="cliente-az" ${ordenacao === "cliente-az" ? "selected" : ""}>Cliente A-Z</option>
+        <option value="cliente-za" ${ordenacao === "cliente-za" ? "selected" : ""}>Cliente Z-A</option>
+      </select>
+    </div>
+
+    <ul class="list" id="fiado-lista"></ul>
+  `;
+
+  renderFiadoLista();
+
+  // A busca só re-renderiza a lista (não o campo em si) — recriar o input a
+  // cada tecla digitada tira o foco dele e só deixa digitar uma letra por vez.
+  document.getElementById("fiado-busca-cliente").addEventListener("input", (e) => {
+    ui.fiado.buscaCliente = e.target.value;
+    renderFiadoLista();
+  });
+  document.getElementById("fiado-filtro-status").addEventListener("change", (e) => {
+    ui.fiado.statusFiltro = e.target.value;
+    renderFiado();
+  });
+  document.getElementById("fiado-filtro-periodo").addEventListener("change", (e) => {
+    ui.fiado.periodoFiltro = e.target.value;
+    renderFiado();
+  });
+  const periodoStartInput = document.getElementById("fiado-periodo-start");
+  const periodoEndInput = document.getElementById("fiado-periodo-end");
+  if (periodoStartInput && periodoEndInput) {
+    periodoStartInput.addEventListener("change", (e) => {
+      ui.fiado.customStart = e.target.value;
+      renderFiado();
+    });
+    periodoEndInput.addEventListener("change", (e) => {
+      ui.fiado.customEnd = e.target.value;
+      renderFiado();
+    });
+  }
+  document.getElementById("fiado-ordenacao").addEventListener("change", (e) => {
+    ui.fiado.ordenacao = e.target.value;
+    renderFiado();
+  });
+}
+
+// Faixa de datas (vencimentos) do filtro "Data prevista" da aba Fiado.
+function getFaixaPrevisao(filtro, customStart, customEnd) {
+  const hoje = new Date();
+  hoje.setHours(0, 0, 0, 0);
+  if (filtro === "hoje") return { start: hoje, end: new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate(), 23, 59, 59, 999) };
+  if (filtro === "esta-semana") {
+    const start = getMondayOfWeek(hoje);
+    const fim = addDays(start, 6);
+    return { start, end: new Date(fim.getFullYear(), fim.getMonth(), fim.getDate(), 23, 59, 59, 999) };
+  }
+  if (filtro === "mes") {
+    return { start: new Date(hoje.getFullYear(), hoje.getMonth(), 1), end: new Date(hoje.getFullYear(), hoje.getMonth() + 1, 0, 23, 59, 59, 999) };
+  }
+  return {
+    start: new Date(`${customStart || toDateKey(hoje)}T00:00:00`),
+    end: new Date(`${customEnd || toDateKey(hoje)}T23:59:59.999`),
+  };
+}
+
+function renderFiadoLista() {
+  const { buscaCliente, statusFiltro, periodoFiltro, customStart, customEnd, ordenacao } = ui.fiado;
+
+  let vendasFiado = vendasDoTurno().filter((v) => v.formaPagamento === "fiado");
+  if (buscaCliente.trim()) {
+    const termo = buscaCliente.trim().toLowerCase();
+    const tDigits = onlyDigits(buscaCliente);
+    vendasFiado = vendasFiado.filter((v) => {
+      const c = getCliente(v.clienteId);
+      return c && (c.nome.toLowerCase().includes(termo) || (tDigits && c.telefone.includes(tDigits)));
+    });
+  }
+  if (statusFiltro) vendasFiado = vendasFiado.filter((v) => getStatusPagamento(v).code === statusFiltro);
+  // O filtro de período agora é pela DATA PREVISTA de pagamento (vencimento),
+  // não pela data em que a venda foi feita.
+  if (periodoFiltro === "vencidos") {
+    vendasFiado = vendasFiado.filter((v) => v.status !== "pago" && isVendaAtrasada(v));
+  } else if (periodoFiltro && periodoFiltro !== "todos") {
+    const { start, end } = getFaixaPrevisao(periodoFiltro, customStart, customEnd);
+    vendasFiado = vendasFiado.filter((v) => {
+      if (!v.dataPrevisaoPagamento) return false;
+      const d = new Date(`${v.dataPrevisaoPagamento}T00:00:00`);
+      return d >= start && d <= end;
+    });
+  }
+
+  const ul = document.getElementById("fiado-lista");
+
+  // Um registro por cliente (agrupado pelo id): só o nome e o total acumulado —
+  // o detalhe de cada venda fica no perfil. A ordenação vale pro cliente todo.
+  const grupos = new Map();
+  vendasFiado.forEach((v) => {
+    if (!grupos.has(v.clienteId)) grupos.set(v.clienteId, []);
+    grupos.get(v.clienteId).push(v);
+  });
+
+  const entradas = [...grupos.entries()].map(([clienteId, vendas]) => {
+    const pendentes = vendas.filter((v) => v.status !== "pago");
+    const datas = pendentes.map((v) => v.dataPrevisaoPagamento).filter(Boolean).sort();
+    const datasVendas = vendas.map((v) => v.data).sort();
+    return {
+      clienteId,
+      vendas,
+      pendentes,
+      datas,
+      nome: getCliente(clienteId)?.nome || "Cliente",
+      emAberto: pendentes.reduce((sum, v) => sum + v.valorRestante, 0),
+      primeiraVenda: datasVendas[0],
+      ultimaVenda: datasVendas[datasVendas.length - 1],
+    };
+  });
+
+  // Quem não tem data prevista vai sempre pro fim nas ordenações por data.
+  const porData = (a, b, pegar, sentido) => {
+    const da = pegar(a);
+    const dataB = pegar(b);
+    if (!da && !dataB) return 0;
+    if (!da) return 1;
+    if (!dataB) return -1;
+    return da < dataB ? -sentido : da > dataB ? sentido : 0;
+  };
+  entradas.sort((a, b) => {
+    if (ordenacao === "previsao-distante") return porData(a, b, (e) => e.datas[e.datas.length - 1], -1);
+    if (ordenacao === "cliente-az") return a.nome.localeCompare(b.nome, "pt-BR");
+    if (ordenacao === "cliente-za") return b.nome.localeCompare(a.nome, "pt-BR");
+    if (ordenacao === "venda-recente") return new Date(b.ultimaVenda) - new Date(a.ultimaVenda);
+    if (ordenacao === "venda-antiga") return new Date(a.primeiraVenda) - new Date(b.primeiraVenda);
+    if (ordenacao === "valor") return b.emAberto - a.emAberto;
+    if (ordenacao === "status") return b.pendentes.length - a.pendentes.length;
+    return porData(a, b, (e) => e.datas[0], 1); // "previsao-proxima" (padrão)
+  });
+
+  ul.innerHTML =
+    entradas.length === 0
+      ? `<li class="empty-state">Nenhuma venda fiado encontrada com esses filtros.</li>`
+      : entradas
+          .map(({ clienteId, vendas, pendentes, datas, nome, emAberto }) => {
+            const atrasado = pendentes.some((v) => isVendaAtrasada(v));
+            const vencimento = datas.length
+              ? `Vence em ${formatDateOnly(datas[0])}${datas[datas.length - 1] !== datas[0] ? ` · até ${formatDateOnly(datas[datas.length - 1])}` : ""}`
+              : pendentes.length
+                ? "Sem data prevista"
+                : "";
+            return `
+            <li class="list-item" data-action="abrir-cliente" data-cliente-id="${clienteId}">
+              <div class="list-item__main">
+                <strong>${nome}</strong>
+                ${vencimento ? `<span class="list-item__meta">${vencimento}</span>` : ""}
+                ${htmlStatusCobranca(getCliente(clienteId))}
+              </div>
+              <div class="list-item__side">
+                <span class="list-item__value-label">${pendentes.length ? "Falta pagar" : "Total pago"}</span>
+                <span class="list-item__value">${formatCurrency(pendentes.length ? emAberto : vendas.reduce((s, v) => s + v.valorTotal, 0))}</span>
+                ${atrasado ? `<span class="badge badge--danger">⏰ Atrasado</span>` : ""}
+              </div>
+            </li>`;
+          })
+          .join("");
+
+  ul.querySelectorAll('[data-action="abrir-cliente"]').forEach((item) => {
+    item.addEventListener("click", () => abrirPerfilCliente(item.dataset.clienteId));
+  });
+}
+
+// Botões Hoje / Dia 15 / Dia 20 / Dia 30 acima de um campo de data.
+function adicionarAtalhosData(input) {
+  const barra = document.createElement("div");
+  barra.className = "date-presets";
+  barra.innerHTML = ["hoje", 5, 15, 20, 30]
+    .map((d) => `<button type="button" class="btn btn--small btn--secondary" data-dia-fixo="${d}">${d === "hoje" ? "Hoje" : `Dia ${d}`}</button>`)
+    .join("");
+  input.insertAdjacentElement("beforebegin", barra);
+  barra.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      input.value = proximoDiaFixo(diaFixoDoBotao(btn));
+    });
+  });
+}
+
+function abrirFormPrevisao(venda, onSaved = renderFiadoLista) {
+  openPrompt({
+    title: "Data prevista de pagamento",
+    fields: [{ id: "data", label: "Nova data prevista", type: "date", value: venda.dataPrevisaoPagamento || toDateKey(new Date()) }],
+    confirmText: "Salvar",
+    onSubmit: (values) => {
+      editarPrevisaoPagamento(venda.id, values.data);
+      showToast("Data prevista atualizada!");
+      onSaved();
+    },
+  });
+  adicionarAtalhosData(document.getElementById("prompt-data"));
+}
+
+/* ==========================================================================
+   16. RENDERIZAÇÃO — ESTOQUE
+   ========================================================================== */
+
+function renderEstoque() {
+  const el = document.getElementById("view-estoque");
+
+  // Com um turno escolhido, mostra também quanto de cada produto saiu hoje
+  // nesse turno (o estoque em si é um só, não tem "estoque da manhã").
+  const idsVendasTurno = new Set(getVendasDoDia().map((v) => v.id));
+  const vendidoPorProduto = {};
+  db.itensVenda.forEach((i) => {
+    if (idsVendasTurno.has(i.vendaId)) vendidoPorProduto[i.produtoId] = (vendidoPorProduto[i.produtoId] || 0) + i.quantidade;
+  });
+
+  el.innerHTML = `
+    <h2 class="view-title">📦 Estoque</h2>
+    <ul class="list">
+      ${db.estoque
+        .map((e) => {
+          const produto = getProduto(e.produtoId);
+          const baixo = e.quantidadeAtual < e.estoqueMinimo;
+          return `
+          <li class="stock-card ${baixo ? "stock-card--baixo" : ""}">
+            <div class="stock-card__header">
+              <span>${produto.icon} ${produto.nome}</span>
+              ${baixo ? `<span class="badge badge--danger">⚠️ ESTOQUE BAIXO</span>` : ""}
+            </div>
+            <p class="stock-card__qty">Estoque atual: <strong>${e.quantidadeAtual}</strong> <span class="stock-card__min">(mín. ${e.estoqueMinimo})</span></p>
+            <p class="stock-card__vendido">Saiu hoje${ui.turno === "todos" ? "" : ` na ${ui.turno === "Manhã" ? "manhã" : "tarde"}`}: <strong>${vendidoPorProduto[e.produtoId] || 0}</strong></p>
+            <div class="stock-card__actions">
+              <button class="btn btn--small btn--secondary" data-action="entrada" data-produto="${e.produtoId}">➕ Entrada</button>
+              <button class="btn btn--small btn--secondary" data-action="saida" data-produto="${e.produtoId}">➖ Saída</button>
+              <button class="btn btn--small btn--secondary" data-action="ajuste" data-produto="${e.produtoId}">🔄 Ajustar</button>
+              <button class="btn btn--small btn--ghost" data-action="minimo" data-produto="${e.produtoId}">Editar mínimo</button>
+            </div>
+          </li>`;
+        })
+        .join("")}
+    </ul>
+  `;
+
+  el.querySelectorAll("[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => handleEstoqueAction(btn.dataset.action, btn.dataset.produto));
+  });
+}
+
+function handleEstoqueAction(acao, produtoId) {
+  const produto = getProduto(produtoId);
+  const registro = getEstoque(produtoId);
+
+  if (acao === "minimo") {
+    openPrompt({
+      title: `Editar mínimo — ${produto.nome}`,
+      fields: [{ id: "minimo", label: "Estoque mínimo", type: "number", inputmode: "numeric", value: registro.estoqueMinimo }],
+      confirmText: "Salvar",
+      onSubmit: (values) => {
+        editarEstoqueMinimo(produtoId, Math.round(values.minimo));
+        showToast("Estoque mínimo atualizado!");
+        renderEstoque();
+      },
+    });
+    return;
+  }
+
+  const titulos = { entrada: "➕ Entrada de estoque", saida: "➖ Saída manual", ajuste: "🔄 Ajustar estoque" };
+  const labelQtd = acao === "ajuste" ? "Nova quantidade atual" : "Quantidade";
+
+  openPrompt({
+    title: `${titulos[acao]} — ${produto.nome}`,
+    fields: [{ id: "quantidade", label: labelQtd, type: "number", inputmode: "numeric", value: acao === "ajuste" ? registro.quantidadeAtual : "" }],
+    confirmText: "Confirmar",
+    onSubmit: (values) => {
+      const quantidade = Math.round(values.quantidade);
+      if (quantidade < 0) {
+        showToast("Informe um valor válido.");
+        return;
+      }
+      ajustarEstoque(produtoId, acao, quantidade);
+      showToast("Estoque atualizado!");
+      renderEstoque();
+    },
+  });
+}
+
+/* ==========================================================================
+   17. RELATÓRIO (overlay)
+   ========================================================================== */
+
+function renderRelatorio() {
+  const el = document.getElementById("overlay-relatorio");
+  const { filtro, customStart, customEnd, clienteFiltro, statusFiltro } = ui.relatorio;
+  const relatorio = gerarRelatorio(filtro, customStart, customEnd, { clienteId: clienteFiltro || null, status: statusFiltro || null });
+  const clientesOrdenados = [...db.clientes].sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+
+  el.innerHTML = `
+    <div class="overlay__header">
+      <button class="icon-btn" data-action="fechar-relatorio">←</button>
+      <h2>📊 Relatório</h2>
+      <span></span>
+    </div>
+    <div class="overlay__body">
+      <div class="form-field">
+        <label for="relatorio-turno">Turno</label>
+        <select id="relatorio-turno">
+          <option value="todos" ${ui.turno === "todos" ? "selected" : ""}>Todos os turnos</option>
+          <option value="Manhã" ${ui.turno === "Manhã" ? "selected" : ""}>Manhã (antes das 12h)</option>
+          <option value="Tarde" ${ui.turno === "Tarde" ? "selected" : ""}>Tarde (12h em diante)</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="relatorio-filtro">Período</label>
+        <select id="relatorio-filtro">
+          <option value="hoje" ${filtro === "hoje" ? "selected" : ""}>Hoje</option>
+          <option value="ontem" ${filtro === "ontem" ? "selected" : ""}>Ontem</option>
+          <option value="esta-semana" ${filtro === "esta-semana" ? "selected" : ""}>Esta semana</option>
+          <option value="semana-passada" ${filtro === "semana-passada" ? "selected" : ""}>Semana passada</option>
+          <option value="7dias" ${filtro === "7dias" ? "selected" : ""}>Últimos 7 dias</option>
+          <option value="mes" ${filtro === "mes" ? "selected" : ""}>Este mês</option>
+          <option value="personalizado" ${filtro === "personalizado" ? "selected" : ""}>Período personalizado</option>
+        </select>
+      </div>
+      ${
+        filtro === "personalizado"
+          ? `<div class="stat-row">
+              <div class="form-field"><label>De</label><input type="date" id="relatorio-start" value="${customStart || toDateKey(new Date())}"/></div>
+              <div class="form-field"><label>Até</label><input type="date" id="relatorio-end" value="${customEnd || toDateKey(new Date())}"/></div>
+            </div>`
+          : ""
+      }
+
+      <div class="stat-row">
+        <div class="form-field">
+          <label for="relatorio-cliente">Cliente</label>
+          <select id="relatorio-cliente">
+            <option value="">Todos os clientes</option>
+            ${clientesOrdenados.map((c) => `<option value="${c.id}" ${clienteFiltro === c.id ? "selected" : ""}>${c.nome}</option>`).join("")}
+          </select>
+        </div>
+        <div class="form-field">
+          <label for="relatorio-status">Status</label>
+          <select id="relatorio-status">
+            <option value="" ${statusFiltro === "" ? "selected" : ""}>Todos</option>
+            <option value="AVISTA" ${statusFiltro === "AVISTA" ? "selected" : ""}>À Vista</option>
+            <option value="FIADO_PENDENTE" ${statusFiltro === "FIADO_PENDENTE" ? "selected" : ""}>Fiado - Pendente</option>
+            <option value="FIADO_PAGO" ${statusFiltro === "FIADO_PAGO" ? "selected" : ""}>Fiado - Pago</option>
+            <option value="DOADO" ${statusFiltro === "DOADO" ? "selected" : ""}>🎁 Doado</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat-box"><span>Vendas</span><strong>${relatorio.quantidadeVendas}</strong></div>
+        <div class="stat-box"><span>Faturamento</span><strong>${formatCurrency(relatorio.faturamentoTotal)}</strong></div>
+      </div>
+      <div class="stat-row">
+        <div class="stat-box"><span>🥟 Salgados</span><strong>${relatorio.salgados}</strong></div>
+        <div class="stat-box"><span>🥤 Refrigerantes</span><strong>${relatorio.refrigerantes}</strong></div>
+        <div class="stat-box"><span>🍫 Trufas</span><strong>${relatorio.trufas}</strong></div>
+      </div>
+
+      <h4 class="section-subtitle">Ciclos do dia (pelo horário do lançamento)</h4>
+      <div class="stat-row">
+        <div class="stat-box"><span>🌅 Manhã (${relatorio.ciclos.Manhã.quantidade})</span><strong>${formatCurrency(relatorio.ciclos.Manhã.total)}</strong></div>
+        <div class="stat-box"><span>🌇 Tarde (${relatorio.ciclos.Tarde.quantidade})</span><strong>${formatCurrency(relatorio.ciclos.Tarde.total)}</strong></div>
+      </div>
+
+      <h4 class="section-subtitle">Financeiro</h4>
+      <ul class="stat-list">
+        <li><span>💵 Recebido à vista</span><strong>${formatCurrency(relatorio.valorRecebidoVista)}</strong></li>
+        <li><span>💰 Recebido de fiado</span><strong>${formatCurrency(relatorio.valorRecebidoFiado)}</strong></li>
+        <li><span>Valor vendido fiado</span><strong>${formatCurrency(relatorio.valorFiado)}</strong></li>
+        <li><span>Ainda a receber (período)</span><strong>${formatCurrency(relatorio.valorAindaAReceber)}</strong></li>
+        <li><span>💚 Crédito recebido (sobras e depósitos)</span><strong>${formatCurrency(relatorio.creditoRecebido)}</strong></li>
+        <li><span>💚 Crédito usado</span><strong>${formatCurrency(relatorio.creditoUsado)}</strong></li>
+        <li><span>🏷️ Desconto dado</span><strong>${formatCurrency(relatorio.descontoTotal)}</strong></li>
+        <li><span>🎁 Doado (${relatorio.doacaoQuantidade} un.)</span><strong>${formatCurrency(relatorio.doacaoTotal)}</strong></li>
+      </ul>
+
+      <h4 class="section-subtitle">Formas de pagamento</h4>
+      <ul class="stat-list">
+        <li><span>📱 PIX</span><strong>${formatCurrency(relatorio.formasPagamento.pix)}</strong></li>
+        <li><span>💵 Dinheiro</span><strong>${formatCurrency(relatorio.formasPagamento.dinheiro)}</strong></li>
+        <li><span>💳 Débito</span><strong>${formatCurrency(relatorio.formasPagamento.debito)}</strong></li>
+        <li><span>💳 Cartão de crédito</span><strong>${formatCurrency(relatorio.formasPagamento.credito)}</strong></li>
+        <li><span>💚 Saldo do cliente (crédito)</span><strong>${formatCurrency(relatorio.formasPagamento.saldo)}</strong></li>
+        <li><span>🔵 Fiado</span><strong>${formatCurrency(relatorio.valorFiado)}</strong></li>
+      </ul>
+
+      <h4 class="section-subtitle">Histórico de vendas (${relatorio.vendas.length})</h4>
+      <ul class="list">
+        ${
+          relatorio.vendas.length === 0
+            ? `<li class="empty-state">Nenhuma venda encontrada com esses filtros.</li>`
+            : relatorio.vendas
+                .map((v) => {
+                  const cliente = getCliente(v.clienteId);
+                  const badge = getStatusPagamento(v);
+                  const itens = getItensDeVenda(v.id).map((i) => `${getProduto(i.produtoId).nome} x${i.quantidade}`).join(", ");
+                  const metaPartes = [...(v.descricao ? [`📝 ${v.descricao}`] : []), itens, `Venda: ${formatDateTime(v.data)}`];
+                  if (v.dataPrevisaoPagamento) metaPartes.push(`Previsto: ${formatDateOnly(v.dataPrevisaoPagamento)}`);
+                  if (v.dataPagamento) metaPartes.push(`Pago em: ${formatDateTime(v.dataPagamento)}`);
+                  return `<li class="list-item">
+                    <div class="list-item__main"><strong>${cliente ? cliente.nome : "Cliente"}</strong><span class="list-item__meta">${metaPartes.join(" · ")}</span></div>
+                    <div class="list-item__side"><span class="list-item__value">${formatCurrency(badge.code === "DOADO" ? getItensDeVenda(v.id).reduce((s, i) => s + i.valorTotal, 0) : v.valorTotal)}</span><span class="badge">${badge.emoji} ${badge.label}</span></div>
+                  </li>`;
+                })
+                .join("")
+        }
+      </ul>
+    </div>
+  `;
+
+  el.querySelector('[data-action="fechar-relatorio"]').addEventListener("click", () => closeOverlay("overlay-relatorio"));
+  document.getElementById("relatorio-turno").addEventListener("change", (e) => definirTurno(e.target.value));
+  document.getElementById("relatorio-filtro").addEventListener("change", (e) => {
+    ui.relatorio.filtro = e.target.value;
+    renderRelatorio();
+  });
+  document.getElementById("relatorio-cliente").addEventListener("change", (e) => {
+    ui.relatorio.clienteFiltro = e.target.value;
+    renderRelatorio();
+  });
+  document.getElementById("relatorio-status").addEventListener("change", (e) => {
+    ui.relatorio.statusFiltro = e.target.value;
+    renderRelatorio();
+  });
+  const startInput = document.getElementById("relatorio-start");
+  const endInput = document.getElementById("relatorio-end");
+  if (startInput && endInput) {
+    startInput.addEventListener("change", (e) => {
+      ui.relatorio.customStart = e.target.value;
+      renderRelatorio();
+    });
+    endInput.addEventListener("change", (e) => {
+      ui.relatorio.customEnd = e.target.value;
+      renderRelatorio();
+    });
+  }
+}
+
+/* ==========================================================================
+   18. CONFIGURAÇÕES
+   ========================================================================== */
+
+function renderConfiguracoes() {
+  const el = document.getElementById("overlay-configuracoes");
+  const c = db.configuracoes;
+
+  el.innerHTML = `
+    <div class="overlay__header">
+      <button class="icon-btn" data-action="fechar-config">←</button>
+      <h2>⚙️ Configurações</h2>
+      <span></span>
+    </div>
+    <div class="overlay__body">
+      <div class="form-field"><label>Nome do negócio</label><input id="cfg-nome" type="text" value="${c.nomeNegocio}" /></div>
+      <div class="form-field"><label>Preço do salgado</label><input id="cfg-salgado" type="number" step="0.01" inputmode="decimal" value="${c.precoSalgado}" /></div>
+      <div class="form-field"><label>Preço do refrigerante</label><input id="cfg-refrigerante" type="number" step="0.01" inputmode="decimal" value="${c.precoRefrigerante}" /></div>
+      <div class="form-field"><label>Preço da trufa (unidade)</label><input id="cfg-trufa" type="number" step="0.01" inputmode="decimal" value="${c.precoTrufa}" /></div>
+      <div class="form-field"><label>Preço do kit com 4 trufas</label><input id="cfg-kit4" type="number" step="0.01" inputmode="decimal" value="${c.precoKit4Trufas}" /></div>
+      <div class="form-field"><label>Meta diária de salgados</label><input id="cfg-meta" type="number" inputmode="numeric" value="${c.metaDiaria}" /></div>
+      <div class="form-field"><label>Estoque mínimo (Salgado)</label><input id="cfg-min-salgado" type="number" inputmode="numeric" value="${c.estoqueMinimoSalgado}" /></div>
+      <button class="btn btn--primary btn--block" id="cfg-salvar-btn">Salvar configurações</button>
+
+      <h4 class="section-subtitle">📊 Planilha do Google</h4>
+      <p class="field-hint">
+        Este app já vem conectado à planilha compartilhada do negócio — todo aparelho usa a
+        mesma automaticamente (sincroniza sozinho a cada minuto). Só use os botões abaixo
+        se precisar forçar uma atualização na hora.
+      </p>
+      <button class="btn btn--secondary btn--block" id="cfg-api-sync-btn">🔄 Sincronizar agora</button>
+      <button class="btn btn--secondary btn--block" id="cfg-api-enviar-btn">📤 Enviar dados deste aparelho para a planilha</button>
+
+      <h4 class="section-subtitle">Segurança dos dados</h4>
+      <button class="btn btn--secondary btn--block" id="cfg-exportar-btn">📤 Exportar dados</button>
+      <label class="btn btn--secondary btn--block" for="cfg-importar-input">📥 Importar dados</label>
+      <input type="file" id="cfg-importar-input" accept="application/json" class="hidden-input" />
+      <button class="btn btn--danger btn--block" id="cfg-apagar-btn">⚠️ Apagar todos os dados</button>
+    </div>
+  `;
+
+  el.querySelector('[data-action="fechar-config"]').addEventListener("click", () => closeOverlay("overlay-configuracoes"));
+  document.getElementById("cfg-salvar-btn").addEventListener("click", () => {
+    salvarConfiguracoes({
+      nomeNegocio: document.getElementById("cfg-nome").value.trim() || "Cowboy Salgados",
+      precoSalgado: parseFloat(document.getElementById("cfg-salgado").value) || 0,
+      precoRefrigerante: parseFloat(document.getElementById("cfg-refrigerante").value) || 0,
+      precoTrufa: parseFloat(document.getElementById("cfg-trufa").value) || 0,
+      precoKit4Trufas: parseFloat(document.getElementById("cfg-kit4").value) || 0,
+      metaDiaria: Math.round(parseFloat(document.getElementById("cfg-meta").value)) || 1,
+      estoqueMinimoSalgado: Math.round(parseFloat(document.getElementById("cfg-min-salgado").value)) || 0,
+    });
+    showToast("Configurações salvas!");
+    renderView(ui.viewAtual);
+  });
+
+  document.getElementById("cfg-api-enviar-btn").addEventListener("click", () => {
+    openConfirm({
+      title: "📤 Enviar dados para a planilha",
+      message: "Isso substitui todo o conteúdo da planilha pelos dados que estão salvos neste aparelho. Use isso só se a planilha estiver desatualizada. Deseja continuar?",
+      confirmText: "Enviar",
+      danger: true,
+      onConfirm: async () => {
+        setSyncStatus("syncing");
+        try {
+          await enviarTudoParaPlanilha();
+          setSyncStatus("online");
+          showToast("Dados enviados para a planilha!");
+        } catch (err) {
+          console.error("Erro ao enviar dados:", err);
+          setSyncStatus("offline");
+          showToast("Não foi possível enviar os dados para a planilha.");
+        }
+      },
+    });
+  });
+
+  document.getElementById("cfg-api-sync-btn").addEventListener("click", () => {
+    openConfirm({
+      title: "🔄 Sincronizar a partir da planilha",
+      message: "Isso substitui os dados deste aparelho pelos dados atuais da planilha. Deseja continuar?",
+      confirmText: "Sincronizar",
+      danger: true,
+      onConfirm: () => syncFromRemote(),
+    });
+  });
+
+  document.getElementById("cfg-exportar-btn").addEventListener("click", exportarDados);
+  document.getElementById("cfg-importar-input").addEventListener("change", (e) => {
+    if (e.target.files[0]) importarDados(e.target.files[0]);
+  });
+  document.getElementById("cfg-apagar-btn").addEventListener("click", confirmarApagarTudo);
+}
+
+function exportarDados() {
+  const blob = new Blob([JSON.stringify(db, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `cowboy-salgados-backup-${toDateKey(new Date())}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast("Dados exportados!");
+}
+
+function importarDados(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const novosDados = JSON.parse(reader.result);
+      const chavesEsperadas = ["clientes", "produtos", "vendas", "itensVenda", "pagamentos", "estoque", "configuracoes"];
+      const valido = chavesEsperadas.every((k) => k in novosDados);
+      if (!valido) throw new Error("Arquivo em formato inválido.");
+
+      openConfirm({
+        title: "Importar dados",
+        message: "Isso substituirá todos os dados atuais pelos dados do arquivo importado. Deseja continuar?",
+        confirmText: "Importar",
+        danger: true,
+        onConfirm: () => {
+          db = novosDados;
+          saveDB();
+          showToast("Dados importados com sucesso!");
+          closeOverlay("overlay-configuracoes");
+          switchView("inicio");
+        },
+      });
+    } catch (err) {
+      showToast("Não foi possível importar: arquivo inválido.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+function confirmarApagarTudo() {
+  openConfirm({
+    title: "⚠️ Apagar todos os dados",
+    message: "Essa ação apagará clientes, vendas, pagamentos e histórico. Deseja continuar?",
+    confirmText: "Continuar",
+    danger: true,
+    onConfirm: () => {
+      openConfirm({
+        title: "Tem certeza absoluta?",
+        message: apiUrl
+          ? "Essa ação NÃO pode ser desfeita e também vai limpar a planilha conectada."
+          : "Essa ação NÃO pode ser desfeita. Tudo ficará vazio (só o Cliente Avulso continua).",
+        confirmText: "Apagar tudo",
+        danger: true,
+        onConfirm: () => {
+          apagarTudoLocal();
+          showToast("Todos os dados foram apagados.");
+          closeOverlay("overlay-configuracoes");
+          switchView("inicio");
+          if (apiUrl) {
+            apiPost("resetAll", {})
+              .then(() => syncFromRemote({ silent: true }))
+              .catch(() => setSyncStatus("offline"));
+          }
+        },
+      });
+    },
+  });
+}
+
+/* ==========================================================================
+   19. FLUXO DE NOVA VENDA (overlay em etapas)
+   ========================================================================== */
+
+function startNovaVenda() {
+  resetNovaVendaState();
+  renderNovaVenda();
+  openOverlay("overlay-nova-venda");
+}
+
+// Atalho usado no perfil do cliente: pula a busca (passo 1) porque o
+// cliente já está selecionado, indo direto pra escolha de produtos.
+function startNovaVendaParaCliente(clienteId) {
+  resetNovaVendaState();
+  ui.novaVenda.clienteId = clienteId;
+  ui.novaVenda.step = 2;
+  renderNovaVenda();
+  openOverlay("overlay-nova-venda");
+}
+
+function fecharNovaVenda() {
+  closeOverlay("overlay-nova-venda");
+  renderView(ui.viewAtual);
+}
+
+function calcularCarrinho() {
+  const itens = Object.entries(ui.novaVenda.itens)
+    .filter(([, qtd]) => qtd > 0)
+    .map(([produtoId, quantidade]) => {
+      const produto = getProduto(produtoId);
+      return { produtoId, produto, quantidade, valorTotal: calcularValorItem(produto, quantidade) };
+    });
+  const total = itens.reduce((sum, i) => sum + i.valorTotal, 0);
+  return { itens, total };
+}
+
+function renderNovaVenda() {
+  const step = ui.novaVenda.step;
+  if (step === 1) renderPassoCliente();
+  else if (step === 2) renderPassoProdutos();
+  else if (step === 3) renderPassoPagamento();
+}
+
+function stepHeader(titulo, mostrarVoltar) {
+  return `
+    <div class="overlay__header">
+      ${mostrarVoltar ? `<button class="icon-btn" data-action="voltar-venda">←</button>` : `<button class="icon-btn" data-action="cancelar-venda">✕</button>`}
+      <h2>${titulo}</h2>
+      <span class="step-indicator">${ui.novaVenda.step}/3</span>
+    </div>
+  `;
+}
+
+// Passo 1 — selecionar cliente
+function renderPassoCliente() {
+  const el = document.getElementById("overlay-nova-venda");
+
+  el.innerHTML = `
+    ${stepHeader("Selecionar cliente", false)}
+    <div class="overlay__body">
+      <input type="search" id="venda-busca-cliente" class="search-input" placeholder="Buscar por nome ou telefone" value="${ui.novaVenda.buscaCliente}" />
+      <button class="btn btn--secondary btn--block" id="venda-novo-cliente-btn">+ Novo cliente</button>
+      <ul class="list" id="venda-lista-clientes"></ul>
+    </div>
+  `;
+
+  renderListaClientesBusca();
+
+  el.querySelector('[data-action="cancelar-venda"]').addEventListener("click", fecharNovaVenda);
+  // A busca só re-renderiza a lista (não o campo em si) — recriar o input a
+  // cada tecla digitada tira o foco dele e só deixa digitar uma letra por vez.
+  document.getElementById("venda-busca-cliente").addEventListener("input", (e) => {
+    ui.novaVenda.buscaCliente = e.target.value;
+    renderListaClientesBusca();
+  });
+  document.getElementById("venda-novo-cliente-btn").addEventListener("click", () => {
+    abrirFormNovoCliente((cliente) => {
+      ui.novaVenda.clienteId = cliente.id;
+      ui.novaVenda.step = 2;
+      renderNovaVenda();
+    });
+  });
+}
+
+function renderListaClientesBusca() {
+  const lista = filtrarClientes(ui.novaVenda.buscaCliente);
+  const ul = document.getElementById("venda-lista-clientes");
+
+  ul.innerHTML = lista
+    .map((c) => {
+      const saldo = calcularSaldoCliente(c.id);
+      return `<li class="list-item" data-cliente-id="${c.id}">
+        <div class="list-item__main"><strong>${c.nome}</strong><span class="list-item__meta">📱 ${formatPhone(c.telefone)}</span></div>
+        <div class="list-item__side">${saldo > 0 ? `<span class="badge">🔴 ${formatCurrency(saldo)}</span>` : ""}</div>
+      </li>`;
+    })
+    .join("");
+
+  ul.querySelectorAll("[data-cliente-id]").forEach((item) => {
+    item.addEventListener("click", () => {
+      ui.novaVenda.clienteId = item.dataset.clienteId;
+      ui.novaVenda.step = 2;
+      renderNovaVenda();
+    });
+  });
+}
+
+// Passo 2 — adicionar produtos ao carrinho
+function renderPassoProdutos() {
+  const el = document.getElementById("overlay-nova-venda");
+  const cliente = getCliente(ui.novaVenda.clienteId);
+  const { itens, total } = calcularCarrinho();
+
+  el.innerHTML = `
+    ${stepHeader("Adicionar produtos", true)}
+    <div class="overlay__body">
+      <p class="selected-cliente">Cliente: <strong>${cliente.nome}</strong></p>
+
+      <div class="product-list">
+        ${db.produtos
+          .map((p) => {
+            const qtd = ui.novaVenda.itens[p.id] || 0;
+            const promo = p.tipo === "trufa" && qtd >= 4;
+            return `
+            <div class="product-card">
+              <div class="product-card__info">
+                <span class="product-card__name">${p.icon} ${p.nome}</span>
+                <span class="product-card__price">${formatCurrency(precoUnitario(p))} / un ${p.tipo === "trufa" ? `· kit 4 = ${formatCurrency(db.configuracoes.precoKit4Trufas)}` : ""}</span>
+              </div>
+              <div class="stepper">
+                <button class="stepper__btn" data-action="menos" data-produto="${p.id}">−</button>
+                <span class="stepper__value">${qtd}</span>
+                <button class="stepper__btn" data-action="mais" data-produto="${p.id}">+</button>
+              </div>
+              ${promo ? `<span class="promo-tag">🎁 Promoção aplicada</span>` : ""}
+            </div>`;
+          })
+          .join("")}
+      </div>
+
+      <h4 class="section-subtitle">Carrinho</h4>
+      <ul class="cart-list">
+        ${
+          itens.length === 0
+            ? `<li class="empty-state">Nenhum produto adicionado.</li>`
+            : itens.map((i) => `<li class="cart-item"><span>${i.produto.nome} x ${i.quantidade}</span><strong>${formatCurrency(i.valorTotal)}</strong></li>`).join("")
+        }
+      </ul>
+      <div class="cart-total"><span>Total</span><strong>${formatCurrency(total)}</strong></div>
+
+      <button class="btn btn--primary btn--block btn--xl" id="venda-avancar-pagamento-btn" ${total <= 0 ? "disabled" : ""}>Avançar</button>
+    </div>
+  `;
+
+  el.querySelector('[data-action="voltar-venda"]').addEventListener("click", () => {
+    ui.novaVenda.step = 1;
+    renderNovaVenda();
+  });
+  el.querySelectorAll("[data-action='mais'], [data-action='menos']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const produtoId = btn.dataset.produto;
+      const atual = ui.novaVenda.itens[produtoId] || 0;
+      const novo = btn.dataset.action === "mais" ? atual + 1 : Math.max(0, atual - 1);
+      ui.novaVenda.itens[produtoId] = novo;
+      renderPassoProdutos();
+    });
+  });
+  const avancarBtn = document.getElementById("venda-avancar-pagamento-btn");
+  if (avancarBtn) {
+    avancarBtn.addEventListener("click", () => {
+      ui.novaVenda.step = 3;
+      renderNovaVenda();
+    });
+  }
+}
+
+// Passo 3 — forma de pagamento e confirmação
+function renderPassoPagamento() {
+  const el = document.getElementById("overlay-nova-venda");
+  const cliente = getCliente(ui.novaVenda.clienteId);
+  const isAvulso = cliente.id === CLIENTE_AVULSO_ID;
+  // Cliente Avulso é venda de balcão sem cadastro — não tem como cobrar
+  // depois, então fiado nunca é uma opção válida pra ele.
+  if (isAvulso && ui.novaVenda.formaPagamento === "fiado") {
+    ui.novaVenda.formaPagamento = null;
+    ui.novaVenda.metodoVista = null;
+  }
+  const { itens, total } = calcularCarrinho();
+  const forma = ui.novaVenda.formaPagamento;
+  const metodo = ui.novaVenda.metodoVista;
+
+  if (forma === "fiado" && !ui.novaVenda.dataPrevisaoPagamento) {
+    ui.novaVenda.dataPrevisaoPagamento = dataPrevisaoPadrao();
+  }
+
+  const desconto = Math.min(total, Math.max(0, ui.novaVenda.desconto || 0));
+  const totalComDesconto = Math.round((total - desconto) * 100) / 100;
+  const creditoDisponivel = isAvulso ? 0 : getCreditoCliente(cliente.id);
+  const pgAtual = calcularPagamentoVenda({
+    clienteId: cliente.id,
+    totalFinal: totalComDesconto,
+    usarCredito: ui.novaVenda.usarCredito,
+    valorRecebido: ui.novaVenda.valorRecebido,
+    isFiado: forma === "fiado",
+  });
+  // Se o crédito cobre a venda toda, não precisa escolher forma de pagamento.
+  const isDoacao = forma === "doacao";
+  const podeConfirmar = forma === "fiado" || isDoacao || (forma === "vista" && (metodo || pgAtual.aReceberAgora <= 0.004));
+
+  el.innerHTML = `
+    ${stepHeader("Forma de pagamento", true)}
+    <div class="overlay__body">
+      <p class="selected-cliente">Cliente: <strong>${cliente.nome}</strong></p>
+      ${
+        isAvulso
+          ? `<div class="form-field">
+              <label for="venda-descricao">📝 Descrição da venda (obrigatório)</label>
+              <input type="text" id="venda-descricao" maxlength="80" placeholder="Ex.: moça da loja ao lado, evento da escola" value="${(ui.novaVenda.descricao || "").replace(/"/g, "&quot;")}" />
+            </div>`
+          : ""
+      }
+      <ul class="cart-list">
+        ${itens.map((i) => `<li class="cart-item"><span>${i.produto.nome} x ${i.quantidade}</span><strong>${formatCurrency(i.valorTotal)}</strong></li>`).join("")}
+      </ul>
+      ${
+        isDoacao
+          ? ""
+          : `<div class="form-field">
+        <label for="venda-desconto">Desconto (R$, opcional)</label>
+        <input type="number" id="venda-desconto" inputmode="decimal" step="0.01" min="0" max="${total}" placeholder="0,00" value="${ui.novaVenda.desconto || ""}" />
+      </div>`
+      }
+      <div class="cart-total"><span>${isDoacao ? "🎁 Valor doado" : "Total"}</span><strong id="venda-total-valor">${formatCurrency(isDoacao ? total : totalComDesconto)}</strong></div>
+
+      <div class="payment-options">
+        <button class="btn ${forma === "vista" ? "btn--primary" : "btn--secondary"} btn--block btn--xl" data-action="forma-vista">À VISTA</button>
+        ${
+          isAvulso
+            ? ""
+            : `<button class="btn ${forma === "fiado" ? "btn--primary" : "btn--secondary"} btn--block btn--xl" data-action="forma-fiado">PAGAR DEPOIS (FIADO)</button>`
+        }
+        <button class="btn ${isDoacao ? "btn--primary" : "btn--secondary"} btn--block btn--xl" data-action="forma-doacao">🎁 DOAÇÃO (sem cobrar)</button>
+      </div>
+      ${isDoacao ? `<p class="fiado-note">🎁 Esta venda será registrada como <strong>doada</strong>: sai do estoque, mas não entra no faturamento nem em contas a receber.</p>` : ""}
+
+      ${
+        forma === "vista"
+          ? `<div class="payment-methods">
+              ${FORMAS_PAGAMENTO_VISTA.map((m) => `<button class="btn ${metodo === m.id ? "btn--primary" : "btn--secondary"}" data-action="metodo" data-metodo="${m.id}">${m.icon} ${m.label}</button>`).join("")}
+            </div>`
+          : ""
+      }
+
+      ${
+        forma && !isDoacao && creditoDisponivel > 0
+          ? `<label class="check-row"><input type="checkbox" id="venda-usar-credito" ${ui.novaVenda.usarCredito ? "checked" : ""} /> 💚 Usar crédito do cliente (${formatCurrency(creditoDisponivel)} disponível)</label>`
+          : ""
+      }
+
+      ${
+        forma === "vista" && !isAvulso
+          ? `<div class="form-field">
+              <label for="venda-valor-recebido">Valor recebido (R$, opcional)</label>
+              <input type="number" id="venda-valor-recebido" inputmode="decimal" step="0.01" min="0" placeholder="Se passar do necessário, a sobra vira crédito" value="${ui.novaVenda.valorRecebido ?? ""}" />
+            </div>`
+          : ""
+      }
+
+      <p class="pagamento-resumo hidden" id="venda-resumo-pagamento"></p>
+
+      ${
+        forma === "fiado"
+          ? `<div class="form-field">
+              <label for="venda-data-previsao">Data prevista de pagamento</label>
+              <p class="date-selected" id="venda-data-selecionada">📅 ${formatDateOnly(ui.novaVenda.dataPrevisaoPagamento)}</p>
+              <div class="date-presets">
+                <button type="button" class="btn btn--small btn--secondary" data-dia-fixo="hoje">Hoje</button>
+                <button type="button" class="btn btn--small btn--secondary" data-dia-fixo="5">Dia 5</button>
+                <button type="button" class="btn btn--small btn--secondary" data-dia-fixo="15">Dia 15</button>
+                <button type="button" class="btn btn--small btn--secondary" data-dia-fixo="20">Dia 20</button>
+                <button type="button" class="btn btn--small btn--secondary" data-dia-fixo="30">Dia 30</button>
+              </div>
+              <label for="venda-data-previsao" class="field-hint">ou escolha uma data manualmente:</label>
+              <input type="date" id="venda-data-previsao" value="${ui.novaVenda.dataPrevisaoPagamento}" />
+            </div>
+            <p class="fiado-note">🔵 Esta venda será registrada como fiado na conta de <strong>${cliente.nome}</strong>.</p>`
+          : ""
+      }
+
+      <button class="btn btn--primary btn--block btn--xl" id="venda-confirmar-btn" ${podeConfirmar ? "" : "disabled"}>Confirmar venda ✅</button>
+    </div>
+  `;
+
+  el.querySelector('[data-action="voltar-venda"]').addEventListener("click", () => {
+    ui.novaVenda.step = 2;
+    renderNovaVenda();
+  });
+  el.querySelector('[data-action="forma-vista"]').addEventListener("click", () => {
+    ui.novaVenda.formaPagamento = "vista";
+    renderPassoPagamento();
+  });
+  el.querySelector('[data-action="forma-doacao"]').addEventListener("click", () => {
+    ui.novaVenda.formaPagamento = "doacao";
+    ui.novaVenda.metodoVista = null;
+    ui.novaVenda.usarCredito = false;
+    ui.novaVenda.valorRecebido = null;
+    ui.novaVenda.desconto = 0;
+    renderPassoPagamento();
+  });
+  el.querySelector('[data-action="forma-fiado"]')?.addEventListener("click", () => {
+    ui.novaVenda.formaPagamento = "fiado";
+    ui.novaVenda.metodoVista = null;
+    renderPassoPagamento();
+  });
+  el.querySelectorAll('[data-action="metodo"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      ui.novaVenda.metodoVista = btn.dataset.metodo;
+      renderPassoPagamento();
+    });
+  });
+  const previsaoInput = document.getElementById("venda-data-previsao");
+  const previsaoSelecionada = document.getElementById("venda-data-selecionada");
+  if (previsaoInput) {
+    previsaoInput.addEventListener("change", (e) => {
+      ui.novaVenda.dataPrevisaoPagamento = e.target.value;
+      if (previsaoSelecionada) previsaoSelecionada.textContent = `📅 ${formatDateOnly(e.target.value)}`;
+    });
+  }
+  // Atalhos pra não depender do calendário nativo do celular (que em
+  // alguns aparelhos não abre ou não mostra a data direito).
+  el.querySelectorAll("[data-dia-fixo]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const novaData = proximoDiaFixo(diaFixoDoBotao(btn));
+      ui.novaVenda.dataPrevisaoPagamento = novaData;
+      if (previsaoInput) previsaoInput.value = novaData;
+      if (previsaoSelecionada) previsaoSelecionada.textContent = `📅 ${formatDateOnly(novaData)}`;
+    });
+  });
+  document.getElementById("venda-descricao")?.addEventListener("input", (e) => {
+    ui.novaVenda.descricao = e.target.value;
+  });
+  const descontoInput = document.getElementById("venda-desconto");
+  if (descontoInput) {
+    descontoInput.addEventListener("input", (e) => {
+      const valor = Math.min(total, Math.max(0, parseFloat(e.target.value.replace(",", ".")) || 0));
+      ui.novaVenda.desconto = valor;
+      document.getElementById("venda-total-valor").textContent = formatCurrency(Math.round((total - valor) * 100) / 100);
+      atualizarResumoNovaVenda();
+    });
+  }
+  document.getElementById("venda-usar-credito")?.addEventListener("change", (e) => {
+    ui.novaVenda.usarCredito = e.target.checked;
+    renderPassoPagamento();
+  });
+  document.getElementById("venda-valor-recebido")?.addEventListener("input", (e) => {
+    const bruto = e.target.value.replace(",", ".");
+    ui.novaVenda.valorRecebido = bruto === "" ? null : parseFloat(bruto) || 0;
+    atualizarResumoNovaVenda();
+  });
+  atualizarResumoNovaVenda();
+  const confirmarBtn = document.getElementById("venda-confirmar-btn");
+  if (confirmarBtn) {
+    confirmarBtn.addEventListener("click", confirmarNovaVenda);
+  }
+}
+
+// Resumo ao vivo do passo de pagamento: crédito usado, quanto receber agora e
+// quanto da entrega do cliente vira crédito.
+function atualizarResumoNovaVenda() {
+  const el = document.getElementById("venda-resumo-pagamento");
+  if (!el) return;
+  const { total } = calcularCarrinho();
+  const desconto = Math.min(total, Math.max(0, ui.novaVenda.desconto || 0));
+  const totalFinal = arred2(total - desconto);
+  const forma = ui.novaVenda.formaPagamento;
+  const pg = calcularPagamentoVenda({
+    clienteId: ui.novaVenda.clienteId,
+    totalFinal,
+    usarCredito: ui.novaVenda.usarCredito,
+    valorRecebido: ui.novaVenda.valorRecebido,
+    isFiado: forma === "fiado",
+  });
+  const linhas = [];
+  if (pg.creditoAplicado > 0) linhas.push(`💚 Crédito usado: <strong>${formatCurrency(pg.creditoAplicado)}</strong>`);
+  if (forma === "vista" && pg.creditoAplicado > 0) linhas.push(`Receber agora: <strong>${formatCurrency(pg.aReceberAgora)}</strong>`);
+  if (forma === "fiado" && pg.creditoAplicado > 0) linhas.push(`Fica devendo: <strong>${formatCurrency(arred2(totalFinal - pg.creditoAplicado))}</strong>`);
+  if (pg.sobra > 0) linhas.push(`💚 Sobra de <strong>${formatCurrency(pg.sobra)}</strong> vira crédito do cliente`);
+  const recebido = ui.novaVenda.valorRecebido;
+  if (forma === "vista" && recebido != null && recebido < pg.aReceberAgora - 0.004) {
+    linhas.push(`<span class="texto-erro">⚠️ O valor recebido é menor que ${formatCurrency(pg.aReceberAgora)}</span>`);
+  }
+  el.innerHTML = linhas.join("<br>");
+  el.classList.toggle("hidden", linhas.length === 0);
+}
+
+function confirmarNovaVenda() {
+  const { itens, total } = calcularCarrinho();
+  if (total <= 0) return;
+
+  // Cliente Avulso não tem cadastro: a descrição é o que identifica a venda depois.
+  const descricao = (ui.novaVenda.descricao || "").trim();
+  if (ui.novaVenda.clienteId === CLIENTE_AVULSO_ID && !descricao) {
+    showToast("Escreva a descrição da venda avulsa.");
+    document.getElementById("venda-descricao")?.focus();
+    return;
+  }
+
+  const isFiado = ui.novaVenda.formaPagamento === "fiado";
+  const isDoacao = ui.novaVenda.formaPagamento === "doacao";
+  const formaPagamentoFinal = isDoacao ? "doacao" : isFiado ? "fiado" : ui.novaVenda.metodoVista || "saldo";
+  const desconto = Math.min(total, Math.max(0, ui.novaVenda.desconto || 0));
+  const totalFinal = arred2(total - desconto);
+  const pg = calcularPagamentoVenda({
+    clienteId: ui.novaVenda.clienteId,
+    totalFinal,
+    usarCredito: ui.novaVenda.usarCredito,
+    valorRecebido: ui.novaVenda.valorRecebido,
+    isFiado,
+  });
+  if (!isFiado && ui.novaVenda.valorRecebido != null && ui.novaVenda.valorRecebido < pg.aReceberAgora - 0.004) {
+    showToast(`O valor recebido é menor que ${formatCurrency(pg.aReceberAgora)}.`);
+    return;
+  }
+
+  registrarVenda({
+    clienteId: ui.novaVenda.clienteId,
+    itens: itens.map((i) => ({ produtoId: i.produtoId, quantidade: i.quantidade })),
+    formaPagamento: formaPagamentoFinal,
+    dataPrevisaoPagamento: isFiado ? ui.novaVenda.dataPrevisaoPagamento : null,
+    desconto,
+    descricao,
+    usarCredito: ui.novaVenda.usarCredito,
+    valorRecebido: ui.novaVenda.valorRecebido,
+  });
+
+  showToast(isDoacao ? `🎁 Doação de ${formatCurrency(total)} registrada!` : `Venda de ${formatCurrency(total - desconto)} registrada!`);
+  fecharNovaVenda();
+  switchView("venda");
+}
+
+/* ==========================================================================
+   19b. ABA ACERTO — receber o pagamento dos clientes o mais rápido possível
+   Aba nova e independente: só usa registrarPagamento / usarCreditoCliente
+   (as mesmas funções do perfil do cliente), então o desconto na dívida
+   segue exatamente a regra de sempre (vendas mais antigas primeiro).
+   ========================================================================== */
+
+const acertoUI = { busca: "", forma: "pix" };
+
+// Cria a seção e o botão da aba pelo JS (não depende de mudar o index.html).
+function montarAbaAcerto() {
+  const secao = document.createElement("section");
+  secao.id = "view-acerto";
+  secao.className = "view hidden";
+  document.querySelector(".views").appendChild(secao);
+
+  const botao = document.createElement("button");
+  botao.className = "nav-btn";
+  botao.dataset.view = "acerto";
+  botao.innerHTML = `<span class="nav-btn__icon">🤝</span><span>Acerto</span>`;
+  document.querySelector('.nav-btn[data-view="fiado"]').insertAdjacentElement("afterend", botao);
+}
+
+// Chave da pessoa pelo NOME (sem acento, maiúscula ou espaço sobrando): se o mesmo
+// nome foi cadastrado mais de uma vez, é a mesma pessoa e conta uma vez só.
+function chaveNomePessoa(nome) {
+  return String(nome || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Pessoas que devem algo — uma linha por NOME, somando tudo que ela deve (mesmo que
+// o nome esteja cadastrado mais de uma vez). Atrasados primeiro, depois o vencimento mais próximo.
+function getClientesParaAcerto(busca) {
+  const grupos = new Map();
+  filtrarClientes(busca).forEach((c) => {
+    const pendentes = db.vendas.filter((v) => v.clienteId === c.id && v.formaPagamento === "fiado" && v.valorRestante > 0);
+    const saldo = calcularSaldoCliente(c.id);
+    if (saldo <= 0.004) return;
+    const chave = chaveNomePessoa(c.nome);
+    const g = grupos.get(chave) || { chave, nome: c.nome, ids: [], saldo: 0, credito: 0, atrasado: false, datas: [], maisAntiga: Infinity };
+    g.ids.push(c.id);
+    g.saldo += saldo;
+    g.credito += getCreditoCliente(c.id);
+    g.atrasado = g.atrasado || pendentes.some((v) => isVendaAtrasada(v));
+    pendentes.forEach((v) => {
+      if (v.dataPrevisaoPagamento) g.datas.push(v.dataPrevisaoPagamento);
+      g.maisAntiga = Math.min(g.maisAntiga, new Date(v.data).getTime() || Infinity);
+    });
+    grupos.set(chave, g);
+  });
+
+  return [...grupos.values()]
+    .map((g) => ({ ...g, saldo: arred2(g.saldo), credito: arred2(g.credito), proximaData: g.datas.sort()[0] || null }))
+    .sort((a, b) => {
+      if (a.atrasado !== b.atrasado) return a.atrasado ? -1 : 1;
+      if (a.proximaData !== b.proximaData) return !a.proximaData ? 1 : !b.proximaData ? -1 : a.proximaData < b.proximaData ? -1 : 1;
+      return b.saldo - a.saldo;
+    });
+}
+
+function renderAcerto() {
+  const el = document.getElementById("view-acerto");
+  const todos = getClientesParaAcerto("");
+  const totalAReceber = arred2(todos.reduce((s, e) => s + e.saldo, 0));
+
+  el.innerHTML = `
+    <h2 class="view-title">🤝 Acerto</h2>
+    <button class="btn btn--secondary btn--block" id="acerto-relpag-btn">💰 Relatório de quem pagou</button>
+    <div class="stat-row stat-row--2">
+      <div class="stat-box stat-box--grande"><span>Total a receber</span><strong>${formatCurrency(totalAReceber)}</strong></div>
+      <div class="stat-box stat-box--grande stat-box--acertado"><span>✅ Acertado hoje</span><strong>${formatCurrency(getRecebidoFiadoHoje())}</strong></div>
+    </div>
+    <p class="acerto-contagem">${todos.length} pessoa(s) devendo</p>
+
+    <h3 class="section-subtitle">Receber em:</h3>
+    <div class="acerto-formas">
+      ${FORMAS_PAGAMENTO_VISTA.map(
+        (m) => `<button type="button" class="btn btn--small ${acertoUI.forma === m.id ? "btn--primary" : "btn--secondary"}" data-forma="${m.id}">${m.icon} ${m.label}</button>`
+      ).join("")}
+    </div>
+
+    <input type="search" class="search-input" id="acerto-busca" placeholder="Buscar cliente por nome ou telefone" value="${acertoUI.busca}" />
+    <ul class="list" id="acerto-lista"></ul>
+  `;
+
+  renderAcertoLista();
+
+  document.getElementById("acerto-relpag-btn").addEventListener("click", abrirRelatorioPagamentos);
+  el.querySelectorAll("[data-forma]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      acertoUI.forma = btn.dataset.forma;
+      renderAcerto();
+    });
+  });
+  document.getElementById("acerto-busca").addEventListener("input", (e) => {
+    acertoUI.busca = e.target.value;
+    renderAcertoLista();
+  });
+}
+
+function renderAcertoLista() {
+  const ul = document.getElementById("acerto-lista");
+  if (!ul) return;
+  const lista = getClientesParaAcerto(acertoUI.busca);
+
+  ul.innerHTML =
+    lista.length === 0
+      ? `<li class="empty-state">${acertoUI.busca.trim() ? "Nenhum cliente devendo com essa busca." : "🎉 Ninguém está devendo!"}</li>`
+      : lista
+          .map((e) => {
+            const chave = encodeURIComponent(e.chave);
+            return `
+            <li class="acerto-card ${e.atrasado ? "acerto-card--atrasado" : ""}">
+              <div class="acerto-card__topo">
+                <div class="list-item__main">
+                  <strong>${e.nome}</strong>
+                  <span class="list-item__meta">${e.proximaData ? `Vence em ${formatDateOnly(e.proximaData)}` : "Sem data prevista"}</span>
+                  ${e.credito > 0 ? `<span class="badge badge--credito">💚 Crédito ${formatCurrency(e.credito)}</span>` : ""}
+                </div>
+                <div class="list-item__side">
+                  <span class="list-item__value-label">Falta pagar</span>
+                  <span class="list-item__value">${formatCurrency(e.saldo)}</span>
+                  ${e.atrasado ? `<span class="badge badge--danger">⏰ Atrasado</span>` : ""}
+                </div>
+              </div>
+              <div class="acerto-card__acoes">
+                <button type="button" class="btn btn--primary" data-acerto="quitar" data-chave="${chave}">✅ Receber tudo ${formatCurrency(e.saldo)}</button>
+                <button type="button" class="btn btn--secondary" data-acerto="parcial" data-chave="${chave}">Outro valor</button>
+                ${e.credito > 0 ? `<button type="button" class="btn btn--secondary" data-acerto="credito" data-chave="${chave}">💚 Usar crédito</button>` : ""}
+              </div>
+            </li>`;
+          })
+          .join("");
+
+  ul.querySelectorAll("[data-acerto]").forEach((btn) => {
+    btn.addEventListener("click", () => acertoAcao(btn.dataset.acerto, decodeURIComponent(btn.dataset.chave)));
+  });
+}
+
+function acertoAcao(acao, chave) {
+  const entrada = getClientesParaAcerto("").find((e) => e.chave === chave);
+  if (!entrada) return;
+  const forma = FORMAS_PAGAMENTO_VISTA.find((m) => m.id === acertoUI.forma);
+
+  if (acao === "quitar") {
+    openConfirm({
+      title: "💰 Receber pagamento",
+      message: `<strong>${entrada.nome}</strong>\nReceber <strong>${formatCurrency(entrada.saldo)}</strong> em ${forma.label}?\nA dívida é quitada na hora.`,
+      confirmText: "Receber",
+      onConfirm: () => acertoReceber(entrada, entrada.saldo),
+    });
+  } else if (acao === "parcial") {
+    openPrompt({
+      title: `💰 Receber de ${entrada.nome}`,
+      fields: [
+        { id: "valor", label: `Valor recebido em ${forma.label} (deve: ${formatCurrency(entrada.saldo)})`, type: "number", inputmode: "decimal", step: "0.01", placeholder: "0,00" },
+      ],
+      confirmText: "Receber",
+      onSubmit: (values) => {
+        if (!(values.valor > 0)) {
+          showToast("Informe um valor válido.");
+          return;
+        }
+        acertoReceber(entrada, values.valor);
+      },
+    });
+  } else if (acao === "credito") {
+    const usado = arred2(entrada.ids.reduce((s, id) => s + usarCreditoCliente(id), 0));
+    showToast(`💚 ${formatCurrency(usado)} de crédito abatido da dívida.`);
+    renderAcerto();
+  }
+}
+
+// Registra o pagamento (abate a dívida automaticamente, vendas mais antigas
+// primeiro) e mostra o resumo grande de sempre. Se a pessoa estiver cadastrada
+// mais de uma vez com o mesmo nome, o valor é repartido entre os cadastros.
+function acertoReceber(entrada, valor) {
+  const saldoAntes = entrada.ids.reduce((s, id) => s + calcularSaldoCliente(id), 0);
+  let restante = arred2(valor);
+  let recebido = 0;
+  let sobra = 0;
+
+  entrada.ids.forEach((id, i) => {
+    if (restante <= 0) return;
+    const ultimo = i === entrada.ids.length - 1;
+    // No último cadastro vai tudo que sobrou: o que passar da dívida vira crédito dele.
+    const parte = ultimo ? restante : Math.min(restante, arred2(calcularSaldoCliente(id)));
+    if (parte <= 0) return;
+    const r = registrarPagamento(id, parte, acertoUI.forma);
+    recebido += r.valorRecebido;
+    sobra += r.sobra;
+    restante = arred2(restante - parte);
+  });
+
+  const novoSaldo = entrada.ids.reduce((s, id) => s + calcularSaldoCliente(id), 0);
+  renderAcerto();
+  mostrarResumoPagamento({
+    cliente: { nome: entrada.nome },
+    saldoAntes: arred2(saldoAntes),
+    valorPago: arred2(recebido),
+    novoSaldo: arred2(novoSaldo),
+    sobra: arred2(sobra),
+  });
+}
+
+/* ==========================================================================
+   19c. RELATÓRIO "QUEM PAGOU" — acertos de dívida (fiado pago)
+   Mesmo formato do "Ver relatório completo" (período, filtros, totais e
+   histórico), mas só com as dívidas que os clientes pagaram. Não inclui compras
+   à vista nem crédito. Só leitura: não altera nenhum dado.
+   ========================================================================== */
+
+const relPagUI = { filtro: "hoje", customStart: null, customEnd: null, clienteFiltro: "", formaFiltro: "" };
+
+function nomeForma(id) {
+  const f = FORMAS_PAGAMENTO_VISTA.find((m) => m.id === id);
+  return f ? `${f.icon} ${f.label}` : id || "—";
+}
+
+// Pagamentos de dívida do período (não entram crédito deixado nem crédito usado).
+function gerarRelatorioPagamentos({ filtro, customStart, customEnd, clienteFiltro, formaFiltro }) {
+  const { start, end } = getPeriodoRange(filtro, customStart, customEnd);
+  let eventos = pagamentosDoTurno().filter((p) => {
+    if (p.vendaId === CREDITO_ID || p.vendaId === CREDITO_USADO_ID) return false;
+    const d = new Date(p.data);
+    return d >= start && d <= end;
+  });
+  if (clienteFiltro) eventos = eventos.filter((p) => p.clienteId === clienteFiltro);
+  if (formaFiltro) eventos = eventos.filter((p) => p.formaPagamento === formaFiltro);
+  eventos = [...eventos].sort((a, b) => new Date(b.data) - new Date(a.data));
+
+  const formas = new Map();
+  eventos.forEach((e) => formas.set(e.formaPagamento, (formas.get(e.formaPagamento) || 0) + e.valor));
+
+  const pessoas = new Map();
+  eventos.forEach((e) => {
+    // Por nome: a mesma pessoa cadastrada duas vezes conta uma vez só.
+    const nome = getCliente(e.clienteId)?.nome || "Cliente";
+    const chave = chaveNomePessoa(nome);
+    const acc = pessoas.get(chave) || { nome, total: 0, quantidade: 0, ultima: 0 };
+    acc.total += e.valor;
+    acc.quantidade += 1;
+    acc.ultima = Math.max(acc.ultima, new Date(e.data).getTime() || 0);
+    pessoas.set(chave, acc);
+  });
+
+  return {
+    periodo: { start, end },
+    eventos,
+    total: arred2(eventos.reduce((s, e) => s + e.valor, 0)),
+    formas: [...formas.entries()].map(([forma, total]) => ({ forma, total: arred2(total) })).sort((a, b) => b.total - a.total),
+    pessoas: [...pessoas.values()].map((p) => ({ ...p, total: arred2(p.total) })).sort((a, b) => b.total - a.total),
+  };
+}
+
+function abrirRelatorioPagamentos() {
+  if (!document.getElementById("overlay-relatorio-pagamentos")) {
+    const overlay = document.createElement("div");
+    overlay.id = "overlay-relatorio-pagamentos";
+    overlay.className = "overlay hidden";
+    document.querySelector(".app").appendChild(overlay);
+  }
+  renderRelatorioPagamentos();
+  openOverlay("overlay-relatorio-pagamentos");
+}
+
+function renderRelatorioPagamentos() {
+  const el = document.getElementById("overlay-relatorio-pagamentos");
+  const f = relPagUI;
+  const r = gerarRelatorioPagamentos(f);
+  const clientesOrdenados = [...db.clientes].sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+  const sel = (cond) => (cond ? "selected" : "");
+
+  el.innerHTML = `
+    <div class="overlay__header">
+      <button class="icon-btn" data-action="fechar-relpag">←</button>
+      <h2>💰 Quem pagou</h2>
+      <span></span>
+    </div>
+    <div class="overlay__body">
+      <p class="field-hint">Acertos de dívida: o que os clientes pagaram do fiado.</p>
+      <div class="form-field">
+        <label for="relpag-turno">Turno</label>
+        <select id="relpag-turno">
+          <option value="todos" ${sel(ui.turno === "todos")}>Todos os turnos</option>
+          <option value="Manhã" ${sel(ui.turno === "Manhã")}>Manhã (antes das 12h)</option>
+          <option value="Tarde" ${sel(ui.turno === "Tarde")}>Tarde (12h em diante)</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="relpag-filtro">Período</label>
+        <select id="relpag-filtro">
+          <option value="hoje" ${sel(f.filtro === "hoje")}>Hoje</option>
+          <option value="ontem" ${sel(f.filtro === "ontem")}>Ontem</option>
+          <option value="esta-semana" ${sel(f.filtro === "esta-semana")}>Esta semana</option>
+          <option value="semana-passada" ${sel(f.filtro === "semana-passada")}>Semana passada</option>
+          <option value="7dias" ${sel(f.filtro === "7dias")}>Últimos 7 dias</option>
+          <option value="mes" ${sel(f.filtro === "mes")}>Este mês</option>
+          <option value="personalizado" ${sel(f.filtro === "personalizado")}>Período personalizado</option>
+        </select>
+      </div>
+      ${
+        f.filtro === "personalizado"
+          ? `<div class="stat-row">
+              <div class="form-field"><label>De</label><input type="date" id="relpag-start" value="${f.customStart || toDateKey(new Date())}"/></div>
+              <div class="form-field"><label>Até</label><input type="date" id="relpag-end" value="${f.customEnd || toDateKey(new Date())}"/></div>
+            </div>`
+          : ""
+      }
+      <div class="form-field">
+        <label for="relpag-cliente">Cliente</label>
+        <select id="relpag-cliente">
+          <option value="">Todos</option>
+          ${clientesOrdenados.map((c) => `<option value="${c.id}" ${sel(f.clienteFiltro === c.id)}>${c.nome}</option>`).join("")}
+        </select>
+      </div>
+
+      <div class="stat-row stat-row--2">
+        <div class="stat-box stat-box--grande"><span>👥 Pessoas que pagaram</span><strong>${r.pessoas.length}</strong></div>
+        <div class="stat-box stat-box--grande stat-box--acertado"><span>💵 Total acertado</span><strong>${formatCurrency(r.total)}</strong></div>
+      </div>
+
+      <h4 class="section-subtitle">Histórico de pagamentos (${r.eventos.length})</h4>
+      <ul class="list">
+        ${
+          r.eventos.length === 0
+            ? `<li class="empty-state">Nenhum pagamento encontrado com esses filtros.</li>`
+            : r.eventos
+                .map((e) => {
+                  const nome = getCliente(e.clienteId)?.nome || "Cliente";
+                  return `<li class="list-item">
+                    <div class="list-item__main"><strong>${nome}</strong><span class="list-item__meta">${formatDateTime(e.data)}</span></div>
+                    <div class="list-item__side"><span class="list-item__value">${formatCurrency(e.valor)}</span></div>
+                  </li>`;
+                })
+                .join("")
+        }
+      </ul>
+    </div>
+  `;
+
+  const reRender = () => renderRelatorioPagamentos();
+  el.querySelector('[data-action="fechar-relpag"]').addEventListener("click", () => closeOverlay("overlay-relatorio-pagamentos"));
+  document.getElementById("relpag-turno").addEventListener("change", (e) => {
+    definirTurno(e.target.value);
+    reRender();
+  });
+  document.getElementById("relpag-filtro").addEventListener("change", (e) => {
+    f.filtro = e.target.value;
+    reRender();
+  });
+  document.getElementById("relpag-cliente").addEventListener("change", (e) => {
+    f.clienteFiltro = e.target.value;
+    reRender();
+  });
+  document.getElementById("relpag-start")?.addEventListener("change", (e) => {
+    f.customStart = e.target.value;
+    reRender();
+  });
+  document.getElementById("relpag-end")?.addEventListener("change", (e) => {
+    f.customEnd = e.target.value;
+    reRender();
+  });
+}
+
+/* ==========================================================================
+   20. INICIALIZAÇÃO
+   ========================================================================== */
+
+// Barra de turno global, fixa logo abaixo do topo em todas as abas.
+function montarBarraTurno() {
+  const barra = document.createElement("div");
+  barra.id = "turno-bar";
+  barra.className = "turno-bar";
+  barra.innerHTML = `
+    <span class="turno-bar__label">Turno:</span>
+    <button type="button" class="turno-bar__btn" data-turno="todos">Todos</button>
+    <button type="button" class="turno-bar__btn" data-turno="Manhã">🌅 Manhã</button>
+    <button type="button" class="turno-bar__btn" data-turno="Tarde">🌇 Tarde</button>
+  `;
+  document.querySelector(".topbar").insertAdjacentElement("afterend", barra);
+  barra.querySelectorAll("[data-turno]").forEach((btn) => {
+    btn.addEventListener("click", () => definirTurno(btn.dataset.turno));
+  });
+  atualizarBarraTurno();
+}
+
+function atualizarBarraTurno() {
+  document.querySelectorAll("#turno-bar [data-turno]").forEach((btn) => {
+    btn.classList.toggle("turno-bar__btn--ativo", btn.dataset.turno === ui.turno);
+  });
+}
+
+function definirTurno(turno) {
+  ui.turno = turno;
+  atualizarBarraTurno();
+  renderView(ui.viewAtual);
+  if (!document.getElementById("overlay-relatorio").classList.contains("hidden")) renderRelatorio();
+}
+
+function initEventListeners() {
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => switchView(btn.dataset.view));
+  });
+  document.getElementById("btn-settings").addEventListener("click", () => {
+    renderConfiguracoes();
+    openOverlay("overlay-configuracoes");
+  });
+  // Voltou pro app (da aba/app do WhatsApp) — pergunta se a cobrança foi enviada.
+  document.addEventListener("visibilitychange", verificarCobrancaPendente);
+  window.addEventListener("focus", verificarCobrancaPendente);
+  window.addEventListener("pageshow", verificarCobrancaPendente);
+  const syncBadge = document.getElementById("sync-badge");
+  if (syncBadge) {
+    syncBadge.addEventListener("click", () => {
+      if (apiUrl) syncFromRemote();
+    });
+  }
+}
+
+const SYNC_INTERVAL_MS = 60 * 1000;
+
+function init() {
+  loadApiUrl();
+  initDB();
+  montarAbaAcerto(); // antes dos listeners, pra o botão novo da navegação também funcionar
+  initEventListeners();
+  montarBarraTurno();
+  switchView("inicio"); // renderiza imediatamente com os dados locais/em cache
+  verificarCobrancaPendente(); // o celular pode ter recarregado o app enquanto o WhatsApp estava aberto
+  setSyncStatus(apiUrl ? "offline" : "offline");
+  if (apiUrl) {
+    syncFromRemote({ silent: true }); // depois, atualiza em segundo plano com a planilha
+    setInterval(() => {
+      if (apiUrl) syncFromRemote({ silent: true });
+    }, SYNC_INTERVAL_MS);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", init);
